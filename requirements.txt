@@ -1,0 +1,22 @@
+# Core numerical / scientific stack
+numpy
+scipy
+
+# EEG / biomedical signal processing
+mne
+antropy
+
+# HDF5 dataset storage
+h5py
+
+# Machine learning
+scikit-learn
+
+# Deep learning
+tensorflow
+
+# Plotting
+matplotlib
+
+# Progress / logging utilities
+tqdm
