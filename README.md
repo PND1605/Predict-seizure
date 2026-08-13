@@ -217,7 +217,7 @@ Warning time  ≥ 120 s
 
 ## 6. Yêu cầu dữ liệu
 
-Pipeline cần dữ liệu EEG dạng **EDF** và file summary của CHB-MIT để xác định seizure onset/offset.
+Pipeline cần dữ liệu EEG dạng **EDF** và file summary của CHB-MIT để xác định seizure onset/offset. Nên tải toàn bộ file của bệnh nhân từ nguồn uy tín (ít nhất cần có đủ file của CHB-01)
 
 Dataset directory được cấu hình bằng biến môi trường:
 
