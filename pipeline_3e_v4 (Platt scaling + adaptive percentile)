@@ -52,7 +52,7 @@ DATA LEAKAGE FIX:
   tính CHỈ trên tập train của MỖI FOLD (xem `compute_entropy_norm_stats`,
   gọi trong `run_single_fold`), rồi áp dụng cho train/val/test của fold đó.
 
-PA1 — CẢI TIẾN GIẢM FAR / TĂNG SENSITIVITY & AUC (không đổi kiến trúc model):
+CẢI TIẾN GIẢM FAR / TĂNG SENSITIVITY & AUC (không đổi kiến trúc model):
   1. Adaptive SOP theo từng seizure (Bandarabadi et al., amplitude-
      distribution-histogram-overlap): thay 1 giá trị pre_ictal_s cố định cho
      MỌI seizure bằng SOP riêng cho từng seizure, chọn trong
@@ -558,7 +558,9 @@ def normalize_multiband(batch: np.ndarray) -> np.ndarray:
 def _entropy_one(args):
     window, sfreq, perm_order, perm_delay = args
     n_ch = window.shape[0]
-    SE = SPE = PE = np.zeros(n_ch, np.float32)
+    SE  = np.zeros(n_ch, np.float32)
+    SPE = np.zeros(n_ch, np.float32)
+    PE  = np.zeros(n_ch, np.float32)
     if _ANTROPY:
         for c in range(n_ch):
             sig = window[c]
