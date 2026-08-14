@@ -52,7 +52,7 @@ DATA LEAKAGE FIX:
   tính CHỈ trên tập train của MỖI FOLD (xem `compute_entropy_norm_stats`,
   gọi trong `run_single_fold`), rồi áp dụng cho train/val/test của fold đó.
 
-CẢI TIẾN GIẢM FAR / TĂNG SENSITIVITY & AUC (không đổi kiến trúc model):
+PA1 — CẢI TIẾN GIẢM FAR / TĂNG SENSITIVITY & AUC (không đổi kiến trúc model):
   1. Adaptive SOP theo từng seizure (Bandarabadi et al., amplitude-
      distribution-histogram-overlap): thay 1 giá trị pre_ictal_s cố định cho
      MỌI seizure bằng SOP riêng cho từng seizure, chọn trong
@@ -558,6 +558,12 @@ def normalize_multiband(batch: np.ndarray) -> np.ndarray:
 def _entropy_one(args):
     window, sfreq, perm_order, perm_delay = args
     n_ch = window.shape[0]
+    # ĐÃ SỬA (bug nghiêm trọng): `SE = SPE = PE = np.zeros(...)` tạo alias —
+    # cả 3 tên biến trỏ vào CÙNG 1 object np.array, khiến SE[c]/SPE[c]/PE[c]
+    # ghi đè lẫn nhau tại cùng ô nhớ → sau vòng lặp, cả 3 mảng giống hệt nhau
+    # (chỉ còn giá trị ghi CUỐI CÙNG = perm_entropy), sample_entropy và
+    # spectral_entropy bị mất hoàn toàn. Ảnh hưởng TOÀN BỘ dataset đã
+    # preprocessing trước đây — cần XÓA HDF5 cũ và chạy lại preprocessing.
     SE  = np.zeros(n_ch, np.float32)
     SPE = np.zeros(n_ch, np.float32)
     PE  = np.zeros(n_ch, np.float32)
@@ -670,6 +676,16 @@ def run_preprocessing(cfg: Config):
         hf.create_dataset("PE",      shape=(0, n_ch),                 maxshape=(None, n_ch),                 dtype="float32", chunks=True)
         hf.create_dataset("y",       shape=(0,),                      maxshape=(None,),                      dtype="float32", chunks=True)
         hf.create_dataset("tts",     shape=(0,),                      maxshape=(None,),                      dtype="float32", chunks=True)
+        # ĐÃ SỬA (bug #1): trước đây start_time (t) tính trong make_windows
+        # nhưng KHÔNG BAO GIỜ được lưu vào HDF5 → DualThresholdVoter không có
+        # cách nào biết được ictal+post-ictal windows đã bị loại bỏ tạo ra
+        # KHOẢNG TRỐNG THỜI GIAN thật (~60-250s) ngay tại mỗi seizure, mà vẫn
+        # coi 2 window liền KỀ VỀ CHỈ SỐ là cách nhau đúng step_s giây — khiến
+        # Firing Power/suppression "nhìn ngược" nhầm vào window preictal ngay
+        # trước onset khi tính cho window interictal ngay SAU post-ictal, có
+        # thể gây FAR giả tạo ngay sau mỗi seizure. Lưu "t" để Voter phát hiện
+        # và reset state đúng tại các ranh giới này (xem DualThresholdVoter).
+        hf.create_dataset("t",       shape=(0,),                      maxshape=(None,),                      dtype="float32", chunks=True)
         hf.create_dataset("file_id", shape=(0,),                      maxshape=(None,),                      dtype="int32",   chunks=True)
         hf.attrs.update({"n_channels": n_ch, "sfreq": cfg.sfreq, "patient": cfg.patient})
 
@@ -719,7 +735,7 @@ def run_preprocessing(cfg: Config):
             fid_arr = np.full(len(Xm), file_id, dtype=np.int32)
 
             nt = written + len(Xm)
-            for k in ("X", "SE", "SPE", "PE", "y", "tts", "file_id"):
+            for k in ("X", "SE", "SPE", "PE", "y", "tts", "t", "file_id"):
                 hf[k].resize(nt, axis=0)
             hf["X"][written:nt]       = Xm
             hf["SE"][written:nt]      = SE
@@ -727,6 +743,7 @@ def run_preprocessing(cfg: Config):
             hf["PE"][written:nt]      = PE
             hf["y"][written:nt]       = labels
             hf["tts"][written:nt]     = tts
+            hf["t"][written:nt]       = st
             hf["file_id"][written:nt] = fid_arr
             written = nt
             del Xm, SE, SPE, PE, labels; gc.collect()
@@ -830,8 +847,11 @@ def make_generator(idx_arr, h5path, cfg, ent_stats: dict, shuffle=True, augment=
 def load_split_to_memory(idx, h5path, cfg, ent_stats: dict):
     """
     Load 1 split vào RAM.
-    Trả về (Xt, Et, y, tts, file_ids) đã sort theo thứ tự index gốc
+    Trả về (Xt, Et, y, tts, t, file_ids) đã sort theo thứ tự index gốc
     (= đúng thứ tự thời gian trong từng file — cần cho Voter chạy đúng).
+    "t" (start_time thật, giây, reset về 0 đầu mỗi file) — dùng để Voter phát
+    hiện khoảng trống thời gian do ictal/post-ictal bị loại (xem bug #1 —
+    DualThresholdVoter).
 
     ent_stats: bắt buộc — median/IQR entropy tính từ TRAIN của fold hiện tại
     (compute_entropy_norm_stats), áp dụng cho split này (train/val/test đều
@@ -849,10 +869,11 @@ def load_split_to_memory(idx, h5path, cfg, ent_stats: dict):
         PEb  = apply_entropy_norm_stats(hf["PE"][idx_s],  pe_med,  pe_iqr)
         yb   = hf["y"][idx_s]
         ttsb = hf["tts"][idx_s]
+        tb   = hf["t"][idx_s]
         fidb = hf["file_id"][idx_s]
     Xt = np.stack([_transform(x, cfg.ds_factor) for x in Xb]).astype(np.float32)
     Et = np.concatenate([SEb, SPEb, PEb], axis=1).astype(np.float32)
-    return Xt, Et, yb.astype(np.float32), ttsb.astype(np.float32), fidb.astype(np.int32)
+    return Xt, Et, yb.astype(np.float32), ttsb.astype(np.float32), tb.astype(np.float32), fidb.astype(np.int32)
 
 
 # ── 7. MODEL ──────────────────────────────────────────────────────────────────
@@ -923,6 +944,38 @@ def _find_runs(mask: np.ndarray):
     return runs
 
 
+def _find_event_runs(mask: np.ndarray, tts_arr: np.ndarray, step_s: float) -> list:
+    """
+    ĐÃ SỬA (bug #2): giống _find_runs nhưng tách thêm 1 run liên tục thành
+    NHIỀU event nếu tts KHÔNG giảm đúng nhịp step_s giữa 2 window liên tiếp.
+
+    VẤN ĐỀ: _find_runs cũ coi MỖI đoạn liên tục nhãn preictal (y>0) là ĐÚNG 1
+    seizure event. Nếu 2 seizure trong CÙNG 1 file đủ gần nhau (vùng preictal
+    của seizure B bắt đầu ngay sau khi post-ictal của seizure A kết thúc,
+    không có window interictal xen giữa), 2 vùng preictal LOGIC KHÁC NHAU
+    dính liền thành 1 run về CHỈ SỐ → bị đếm nhầm thành 1 event thay vì 2,
+    làm sai n_events/Sensitivity/FAR của file đó.
+
+    NGUYÊN LÝ SỬA: trong 1 vùng preictal đúng nghĩa (đếm ngược tới ĐÚNG 1
+    onset), tts phải giảm đều đặn đúng step_s mỗi window (window sau luôn gần
+    onset hơn window trước đúng step_s giây). Nếu tts KHÔNG giảm đúng nhịp đó
+    (tăng vọt lên, hoặc giảm khác step_s) → đã chuyển sang đếm ngược cho 1
+    seizure KHÁC → tách thành event mới tại đúng điểm đó. Không cần thêm dữ
+    liệu ngoài tts_arr đã có sẵn.
+    """
+    raw_runs = _find_runs(mask)
+    event_runs = []
+    for s, e in raw_runs:
+        seg_start = s
+        for i in range(s + 1, e):
+            expected = tts_arr[i - 1] - step_s
+            if not np.isclose(tts_arr[i], expected, atol=step_s / 2.0, equal_nan=False):
+                event_runs.append((seg_start, i))
+                seg_start = i
+        event_runs.append((seg_start, e))
+    return event_runs
+
+
 class DualThresholdVoter:
     """
     3-layer post-processing filter (PA1 — Firing Power):
@@ -934,30 +987,84 @@ class DualThresholdVoter:
        đây thr_on áp lên vote nhị phân còn thr_off áp lên raw score — 2 tín
        hiệu khác nhau, không nhất quán, dễ gây flicker/FAR).
     3. Suppression window — chống đếm trùng 1 episode.
+
+    ĐÃ SỬA (bug #1): trước đây fp_steps/suppression_steps tính hoàn toàn theo
+    CHỈ SỐ (index), giả định 2 window liên tiếp luôn cách nhau đúng step_s
+    giây thật. SAI tại ranh giới mỗi seizure — window preictal cuối cùng
+    trước onset và window interictal đầu tiên sau post-ictal LIỀN KỀ VỀ CHỈ
+    SỐ (vì window ictal+post-ictal ở giữa đã bị loại khỏi HDF5 lúc
+    preprocessing) nhưng cách nhau THẬT ~60-250s ngoài đời. Nếu không phát
+    hiện, Firing Power ngay sau mỗi seizure "nhìn ngược" nhầm vào các window
+    preictal (score cao) ngay trước onset thay vì các window interictal thật
+    sự gần đó → có thể giữ alarm ON giả tạo, tăng FAR đúng ngay giai đoạn
+    nhạy cảm nhất (ngay sau 1 seizure). Sửa: truyền thêm `t` (start_time thật,
+    xem load_split_to_memory) để phát hiện khoảng trống thời gian
+    (t[i]-t[i-1] > step_s*1.5) và RESET hoàn toàn state/suppression/cửa sổ
+    Firing Power tại đúng ranh giới đó — không cho thông tin "rò" qua gap.
     """
     def __init__(self, cfg: Config):
         assert cfg.thr_off_min > 0, "thr_off_min phải > 0"
         self.fp_steps = max(1, int(round(cfg.fp_window_s / cfg.step_s)))
         self.suppression_steps = max(1, int(round(cfg.suppression_s / cfg.step_s)))
+        self.step_s = cfg.step_s
 
-    def _firing_power(self, scores: np.ndarray, thr_on: float) -> np.ndarray:
+    def _segment_ids(self, t: np.ndarray) -> np.ndarray:
+        """
+        Gán segment_id tăng dần mỗi khi phát hiện khoảng trống thời gian thật
+        (t[i]-t[i-1] > step_s*1.5 — dung sai 1.5x để tránh nhiễu làm tròn số
+        thực, trong khi gap thật do loại ictal/post-ictal luôn >> step_s).
+        """
+        n = len(t)
+        seg = np.zeros(n, dtype=np.int64)
+        for i in range(1, n):
+            if (t[i] - t[i - 1]) > self.step_s * 1.5:
+                seg[i] = seg[i - 1] + 1
+            else:
+                seg[i] = seg[i - 1]
+        return seg
+
+    def _firing_power(self, scores: np.ndarray, thr_on: float, t: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Tỷ lệ (0..1) window có score ≥ thr_on trong cửa sổ trượt fp_steps gần
-        nhất, tính vectorized bằng cumsum — O(N).
+        nhất. Nếu có `t`, cửa sổ trượt KHÔNG được vượt qua ranh giới segment
+        (gap thời gian thật) — xem docstring class.
         """
-        pos  = (scores >= thr_on).astype(np.float64)
-        csum = np.concatenate(([0.0], np.cumsum(pos)))
-        idx  = np.arange(len(scores))
-        s    = np.maximum(0, idx - self.fp_steps + 1)
-        count = csum[idx + 1] - csum[s]
-        window_len = (idx - s + 1).astype(np.float64)
-        return count / window_len
+        pos = (scores >= thr_on).astype(np.float64)
+        n = len(scores)
 
-    def predict(self, scores: np.ndarray, thr_on: float, thr_off: float) -> np.ndarray:
-        fp    = self._firing_power(scores, thr_on)
+        if t is None:
+            csum = np.concatenate(([0.0], np.cumsum(pos)))
+            idx  = np.arange(n)
+            s    = np.maximum(0, idx - self.fp_steps + 1)
+            count = csum[idx + 1] - csum[s]
+            window_len = (idx - s + 1).astype(np.float64)
+            return count / window_len
+
+        seg = self._segment_ids(t)
+        csum = np.concatenate(([0.0], np.cumsum(pos)))
+        fp = np.zeros(n, dtype=np.float64)
+        seg_start = 0
+        for i in range(n):
+            if i > 0 and seg[i] != seg[i - 1]:
+                seg_start = i
+            s = max(seg_start, i - self.fp_steps + 1)
+            fp[i] = (csum[i + 1] - csum[s]) / (i - s + 1)
+        return fp
+
+    def predict(self, scores: np.ndarray, thr_on: float, thr_off: float,
+                t: Optional[np.ndarray] = None) -> np.ndarray:
+        fp    = self._firing_power(scores, thr_on, t=t)
         alarm = np.zeros(len(scores), dtype=np.int32)
         state, suppress_until = 0, -1
+        seg = self._segment_ids(t) if t is not None else None
+
         for i in range(len(scores)):
+            if seg is not None and i > 0 and seg[i] != seg[i - 1]:
+                # Ranh giới gap thời gian thật (seizure vừa xảy ra) — KHÔNG
+                # cho state ON hay suppression "leo" qua ranh giới này, vì
+                # chúng phản ánh 1 quá trình thời gian không còn liên tục.
+                state = 0
+                suppress_until = -1
             if state == 0:
                 if fp[i] >= thr_on and i > suppress_until:
                     state = 1
@@ -979,19 +1086,27 @@ class DualThresholdVoter:
 # ── 9. CLINICAL METRICS (event-level, SPH-aware, per-file) ───────────────────
 
 def metrics_one_file(y_true, scores, tts_arr, voter: DualThresholdVoter,
-                     thr_on: float, thr_off: float, cfg: Config) -> dict:
+                     thr_on: float, thr_off: float, cfg: Config,
+                     t: Optional[np.ndarray] = None) -> dict:
     """
     Tính metrics trên 1 FILE LIÊN TỤC DUY NHẤT.
     TP  = event có alarm với tts ≥ SPH_S   (actionable)
     FN_late = alarm bật nhưng tts < SPH_S  (phát hiện nhưng quá muộn)
     FN_miss = không alarm nào trong event   (bỏ sót hoàn toàn)
     FAR = alarm episodes trong interictal / total interictal hours
+
+    `t` (start_time thật): truyền vào Voter để phát hiện/reset tại gap thời
+    gian thật do ictal/post-ictal bị loại (xem bug #1 — DualThresholdVoter).
     """
-    alarm = voter.predict(scores, thr_on, thr_off)
+    alarm = voter.predict(scores, thr_on, thr_off, t=t)
     y_bin = (y_true > 0).astype(int)
 
     # ── Event-level Sensitivity ───────────────────────────────────────────────
-    runs = _find_runs(y_bin == 1)
+    # ĐÃ SỬA (bug #2): dùng _find_event_runs thay _find_runs — tách 1 run
+    # thành nhiều event nếu tts không giảm đúng nhịp step_s (dấu hiệu 2
+    # seizure gần nhau trong cùng file bị dính liền về chỉ số). Xem docstring
+    # _find_event_runs.
+    runs = _find_event_runs(y_bin == 1, tts_arr, cfg.step_s)
     tp = fn_late = fn_miss = 0
     warn_times = []
     for s, e in runs:
@@ -1037,10 +1152,13 @@ def metrics_one_file(y_true, scores, tts_arr, voter: DualThresholdVoter,
     }
 
 
-def metrics_grouped(y_true, scores, tts_arr, file_ids, voter, thr_on, thr_off, cfg):
+def metrics_grouped(y_true, scores, tts_arr, file_ids, voter, thr_on, thr_off, cfg,
+                     t: Optional[np.ndarray] = None):
     """
     Chạy metrics_one_file RIÊNG cho từng file_id → gộp kết quả.
     Tránh state Voter (hysteresis/suppression) rò xuyên biên file.
+    `t`: start_time thật (optional, None = giữ hành vi cũ không gap-aware —
+    dùng khi không có sẵn t, VD code cũ gọi lại hàm này).
     """
     alarm_full = np.zeros(len(y_true), dtype=np.int32)
     agg = dict(tp=0, fn_late=0, fn_miss=0, n_events=0,
@@ -1048,7 +1166,8 @@ def metrics_grouped(y_true, scores, tts_arr, file_ids, voter, thr_on, thr_off, c
 
     for fid in np.unique(file_ids):
         g = np.where(file_ids == fid)[0]
-        m = metrics_one_file(y_true[g], scores[g], tts_arr[g], voter, thr_on, thr_off, cfg)
+        t_g = t[g] if t is not None else None
+        m = metrics_one_file(y_true[g], scores[g], tts_arr[g], voter, thr_on, thr_off, cfg, t=t_g)
         alarm_full[g] = m["alarm"]
         for k in ("tp", "fn_late", "fn_miss", "n_events", "fa_episodes"):
             agg[k] += m[k]
@@ -1108,7 +1227,7 @@ def fit_platt_scaling(val_scores: np.ndarray, y_val: np.ndarray):
     return calibrate
 
 
-def select_threshold(y_val, val_scores, val_tts, val_fids, voter, cfg):
+def select_threshold(y_val, val_scores, val_tts, val_fids, voter, cfg, val_t=None):
     """
     Chọn (thr_on, thr_off) cho fold hiện tại — 2 chế độ, KHÔNG bao giờ nhìn
     vào nhãn/event của val để chọn threshold (loại bỏ hoàn toàn nguồn overfit
@@ -1140,7 +1259,7 @@ def select_threshold(y_val, val_scores, val_tts, val_fids, voter, cfg):
     """
     if cfg.threshold_mode == "absolute":
         thr_on, thr_off = cfg.fixed_thr_on, cfg.fixed_thr_off
-        m_val = metrics_grouped(y_val, val_scores, val_tts, val_fids, voter, thr_on, thr_off, cfg)
+        m_val = metrics_grouped(y_val, val_scores, val_tts, val_fids, voter, thr_on, thr_off, cfg, t=val_t)
         log.info(f"  Threshold ABSOLUTE cố định: thr_on={thr_on:.2f} thr_off={thr_off:.2f} "
                  f"(val ref: Sens={m_val['sensitivity']:.3f} FAR={m_val['far_per_h']:.3f}/h — "
                  f"không dùng để chọn threshold, chỉ log tham khảo)")
@@ -1159,7 +1278,7 @@ def select_threshold(y_val, val_scores, val_tts, val_fids, voter, cfg):
         # thiểu thr_off_min, phòng trường hợp percentile suy biến (VD score
         # gần như hằng số trên val làm 2 percentile trùng/lệch nhau).
         thr_off = max(cfg.thr_off_min, min(thr_off, thr_on - 0.01))
-        m_val = metrics_grouped(y_val, val_scores, val_tts, val_fids, voter, thr_on, thr_off, cfg)
+        m_val = metrics_grouped(y_val, val_scores, val_tts, val_fids, voter, thr_on, thr_off, cfg, t=val_t)
         log.info(f"  Threshold RELATIVE tự thích nghi: preictal_frac={preictal_frac:.3f} "
                  f"→ percentile {pct_on:.1f}/{pct_off:.1f} → thr_on={thr_on:.3f} thr_off={thr_off:.3f} "
                  f"(val ref: Sens={m_val['sensitivity']:.3f} FAR={m_val['far_per_h']:.3f}/h — "
@@ -1290,7 +1409,7 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     ]
 
     # Val data in memory (small enough for eval during training)
-    Xv, Ev, yv, _, _ = load_split_to_memory(val_idx, h5path, cfg, ent_stats)
+    Xv, Ev, yv, _, _, _ = load_split_to_memory(val_idx, h5path, cfg, ent_stats)
     val_data = ({"temporal": Xv, "entropy": Ev}, yv)
 
     # ĐO THỜI GIAN từng giai đoạn — để chẩn đoán fold nào chậm bất thường (vd.
@@ -1318,8 +1437,8 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     # ── Predict on val and test ───────────────────────────────────────────────
     # ent_stats luôn từ TRAIN của fold này — áp lên cả val và test, không
     # tính lại stats riêng cho val/test (đó chính là điều cần tránh).
-    Xv, Ev, yv, ttsv, fidv = load_split_to_memory(val_idx,  h5path, cfg, ent_stats)
-    Xt, Et, yt, ttst, fidt = load_split_to_memory(te_idx,   h5path, cfg, ent_stats)
+    Xv, Ev, yv, ttsv, tv, fidv = load_split_to_memory(val_idx,  h5path, cfg, ent_stats)
+    Xt, Et, yt, ttst, tt, fidt = load_split_to_memory(te_idx,   h5path, cfg, ent_stats)
 
     t_pred0 = time.time()
     # ĐÃ SỬA: batch_size=cfg.batch_size (khớp với train) thay vì hardcode 256,
@@ -1360,11 +1479,11 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     # cfg.threshold_mode = "absolute" | "relative" (xem select_threshold + Config).
     voter = DualThresholdVoter(cfg)
     t_grid0 = time.time()
-    thr_on, thr_off = select_threshold(yv, pred_val, ttsv, fidv, voter, cfg)
+    thr_on, thr_off = select_threshold(yv, pred_val, ttsv, fidv, voter, cfg, val_t=tv)
     log.info(f"  [time] threshold selection: {time.time()-t_grid0:.1f}s")
 
     # ── Clinical metrics on TEST (no data leakage) ────────────────────────────
-    m = metrics_grouped(yt, pred_test, ttst, fidt, voter, thr_on, thr_off, cfg)
+    m = metrics_grouped(yt, pred_test, ttst, fidt, voter, thr_on, thr_off, cfg, t=tt)
 
     log.info(f"  AUC-ROC={auc_roc:.3f}  AUC-PR={auc_pr:.3f}")
     log.info(f"  Sensitivity={m['sensitivity']:.3f}  ({m['tp']} TP / {m['n_events']} events)")
