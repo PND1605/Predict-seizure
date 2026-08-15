@@ -1301,32 +1301,63 @@ def get_seizure_file_ids(file_ids, y_all):
 def generate_loso_folds(file_ids, y_all):
     """
     Sinh N folds cho LOSO-CV.
-    fold_i: test  = seizure_file[i]
+    fold_i: test  = seizure_file[i]  +  1 nhóm nhỏ file interictal THUẦN
+                     (không có seizure nào) — chỉ để đo FAR đáng tin cậy hơn,
+                     KHÔNG ảnh hưởng Sensitivity (các file này không có event).
             val   = seizure_file[(i+1) % N]   (for threshold grid-search)
             train = tất cả còn lại
+
+    ĐÃ SỬA (FAR mỗi fold không đáng tin): trước đây test mỗi fold CHỈ có 1
+    seizure file → phần interictal "sạch" còn lại trong đúng file đó (sau khi
+    loại preictal/ictal/post-ictal) có thể rất ít (VD fold 7: 0.1h) → 1 báo
+    động giả ngẫu nhiên cũng làm FAR nhảy vọt vô nghĩa. Trong khi đó ~20 file
+    interictal-thuần của dataset chưa BAO GIỜ được dùng để đánh giá — chỉ nằm
+    trong train.
+    Cách sửa: chia đều các file interictal-thuần thành N nhóm (round-robin),
+    mỗi fold nhận 1 nhóm nhỏ để CỘNG THÊM vào test (chỉ dùng tính FAR — không
+    có seizure nên không đóng góp gì cho Sensitivity). Các file trong nhóm đó
+    bị loại khỏi train CHỈ của fold được gán (giống hệt cách test_fid/val_fid
+    vốn đã bị loại) — không train lại gì thêm, không thêm epoch, nên hầu như
+    không tăng thời gian train. Chi phí tăng thêm chỉ là 1 lượt forward-pass
+    (inference, không backprop) trên vài file thuần lúc evaluate test → rẻ.
     """
-    sz_files  = get_seizure_file_ids(file_ids, y_all)
-    all_files = np.unique(file_ids)
+    sz_files   = get_seizure_file_ids(file_ids, y_all)
+    all_files  = np.unique(file_ids)
+    pure_files = [f for f in all_files if f not in sz_files]   # file interictal-thuần
     N = len(sz_files)
 
     if N < 2:
         raise ValueError(f"LOSO-CV cần ≥ 2 seizure files. Hiện có: {N}. "
                          f"Kiểm tra lại preprocessing / dataset path.")
 
+    # Round-robin chia pure_files thành N nhóm, mỗi fold 1 nhóm nhỏ (~len/N
+    # file) — KHÔNG dồn hết 20 file vào 1 fold để tránh test/train lệch quá
+    # nhiều giữa các fold.
+    pure_groups = [[] for _ in range(N)]
+    for k, pf in enumerate(pure_files):
+        pure_groups[k % N].append(pf)
+
     folds = []
     for i, test_fid in enumerate(sz_files):
-        val_fid = sz_files[(i + 1) % N]
-        train_fids = [f for f in all_files if f != test_fid and f != val_fid]
+        val_fid    = sz_files[(i + 1) % N]
+        extra_pure = pure_groups[i]                      # file thuần gán cho fold này
+        excluded   = {test_fid, val_fid, *extra_pure}
+        train_fids = [f for f in all_files if f not in excluded]
+        test_fids_all = [test_fid, *extra_pure]
 
         folds.append({
-            "fold":        i,
-            "test_fid":    test_fid,
-            "val_fid":     val_fid,
-            "train_idx":   np.where(np.isin(file_ids, train_fids))[0],
-            "val_idx":     np.where(file_ids == val_fid)[0],
-            "test_idx":    np.where(file_ids == test_fid)[0],
+            "fold":            i,
+            "test_fid":        test_fid,
+            "val_fid":         val_fid,
+            "extra_pure_fids": extra_pure,
+            "train_idx":       np.where(np.isin(file_ids, train_fids))[0],
+            "val_idx":         np.where(file_ids == val_fid)[0],
+            "test_idx":        np.where(np.isin(file_ids, test_fids_all))[0],
         })
     log.info(f"LOSO-CV: {N} folds | seizure files: {sz_files}")
+    log.info(f"  {len(pure_files)} file interictal-thuần → chia round-robin "
+             f"~{len(pure_files)//N} file/fold, cộng vào test để tính FAR "
+             f"(không ảnh hưởng train time/Sensitivity)")
     return folds
 
 
@@ -1338,8 +1369,10 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     val_idx = fold_info["val_idx"]
     te_idx  = fold_info["test_idx"]
 
+    extra_pure = fold_info.get("extra_pure_fids", [])
     log.info(f"\n{'─'*55}")
-    log.info(f"FOLD {fi+1} | test_file={fold_info['test_fid']} | val_file={fold_info['val_fid']}")
+    log.info(f"FOLD {fi+1} | test_file={fold_info['test_fid']} | val_file={fold_info['val_fid']} "
+             f"| +{len(extra_pure)} file interictal-thuần vào test: {extra_pure}")
     log.info(f"  Train: {len(tr_idx)} windows | Val: {len(val_idx)} | Test: {len(te_idx)}")
 
     # ── Balance training set (interictal : pre-ictal ≈ 2:1) ──────────────────
