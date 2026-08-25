@@ -87,6 +87,38 @@ ARCHITECTURE (đơn giản hóa so với v3-v7, phù hợp dataset nhỏ ~7 seiz
 
 # ── 1. IMPORTS ────────────────────────────────────────────────────────────────
 import os, re, gc, json, logging, time
+
+# ── ĐÃ THÊM: ép determinism TRƯỚC khi import tensorflow ────────────────────
+# Phát hiện thực nghiệm: dù đã cố định tf.random.set_seed + np.random.seed
+# theo từng fold (fix #4), vẫn quan sát được 1 fold (test_file=3) có AUC-ROC
+# lệch tới 0.7 (0.125→0.834) giữa 2 lần chạy CÙNG config — trong khi
+# threshold_mode (biến duy nhất đổi giữa 2 lần chạy đó) về mặt lý thuyết
+# KHÔNG THỂ ảnh hưởng AUC-ROC (AUC tính từ pred_test trước khi threshold
+# tồn tại). Kết luận: vẫn còn nhiễu không tất định trong chính bước train,
+# nhiều khả năng từ các phép reduce/sum đa luồng trên CPU (thứ tự cộng dồn
+# floating-point phụ thuộc lịch trình luồng, tf.random.set_seed không kiểm
+# soát được việc này). 2 biến môi trường dưới đây PHẢI set TRƯỚC khi
+# tensorflow được import lần đầu mới có tác dụng đầy đủ — đặt ở đây, trên
+# cùng file, trước dòng "import tensorflow as tf".
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")     # ép cuDNN/nhiều CPU-op dùng thuật toán tất định
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")    # tương tự, riêng cho cuDNN (không ảnh hưởng nếu chạy CPU-only)
+os.environ.setdefault("PYTHONHASHSEED", "0")            # cố định hash-seed (ảnh hưởng thứ tự dict/set nếu có dùng)
+
+# ── ĐÃ THÊM LẦN 3: khống chế thread pool của BLAS (OpenBLAS/MKL) — TÁCH
+# BIỆT hoàn toàn với thread pool của TensorFlow. Bằng chứng thực nghiệm: sau
+# khi ép TF đơn luồng (set_intra/inter_op_parallelism_threads=1) + fix RNG
+# cục bộ, fold test_file=3 đã tái lập gần như tuyệt đối (chênh lệch AUC chỉ
+# 0.002, từ 0.69 trước đó) — XÁC NHẬN đúng gốc rễ là nhiễu đa luồng CPU. Tuy
+# nhiên các fold KHÁC vẫn còn lệch nhỏ (0.02-0.11) — vì numpy/scipy (dùng
+# trong Platt scaling's LogisticRegression, và một số op TF gọi xuống BLAS
+# hệ thống) có thread pool RIÊNG, KHÔNG bị tf.config.threading khống chế.
+# Các biến môi trường này PHẢI set trước khi numpy được import lần đầu.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")   # phòng trường hợp chạy trên macOS/Accelerate
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -97,8 +129,10 @@ import numpy as np
 import h5py
 import mne
 from scipy.signal import decimate as sp_decimate, butter, sosfiltfilt
+from scipy.stats import binom as scipy_binom
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
 import tensorflow as tf
 from tensorflow.keras import Input, Model
 from tensorflow.keras.layers import (
@@ -123,6 +157,47 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("eeg")
+
+# ── ĐÃ THÊM: enable_op_determinism() — API chính thức của TF (>=2.9) ép MỌI
+# op hỗ trợ dùng cài đặt tất định, kể cả khi chạy đa luồng (khác 2 biến môi
+# trường ở trên vốn chỉ ảnh hưởng 1 phần op/chủ yếu GPU). Đây là fix trực
+# tiếp nhất cho vấn đề "cùng seed, cùng config, AUC vẫn lệch 0.7 ở 1 fold"
+# quan sát được thực nghiệm. Bọc try/except vì API chỉ có từ TF 2.9+ — nếu
+# bản TF cũ hơn, log cảnh báo thay vì crash (fallback về mức determinism đã
+# có từ 2 biến môi trường + set_seed).
+try:
+    tf.config.experimental.enable_op_determinism()
+    log.info("[determinism] Đã bật tf.config.experimental.enable_op_determinism().")
+except AttributeError:
+    log.warning("[determinism] TF version không có enable_op_determinism() (cần TF>=2.9) — "
+                "chỉ còn dựa vào TF_DETERMINISTIC_OPS + set_seed, có thể vẫn còn nhiễu nhỏ.")
+
+# ── ĐÃ THÊM LẦN 2: ép chạy ĐƠN LUỒNG — fix RNG cục bộ (make_generator) +
+# enable_op_determinism() ĐÃ ÁP DỤNG nhưng đối chiếu 2 lần chạy v11 thật cho
+# thấy 1 fold (test_file=3) VẪN lệch AUC-ROC tới 0.69 (0.828 vs 0.136) — gần
+# như KHÔNG đổi so với trước khi có 2 fix trên. Kết luận: nguồn nhiễu còn
+# lại không phải từ code Python của ta (đã loại ở fix trước) mà từ chính
+# TÍNH KHÔNG TẤT ĐỊNH CỦA CÁC OP CPU ĐA LUỒNG bên trong TensorFlow —
+# enable_op_determinism() chỉ đảm bảo determinism cho các op CÓ cài đặt tất
+# định, nhưng theo tài liệu TF, một số kernel CPU (đặc biệt các phép reduce/
+# sum trong Conv1D, BatchNorm, LSTM chạy qua Eigen thread pool) VẪN có thể
+# cho kết quả khác nhau tuỳ thứ tự cộng dồn floating-point khi công việc bị
+# chia cho nhiều luồng — thứ tự này phụ thuộc lịch trình hệ điều hành, không
+# tất định dù đã set mọi seed. Fix DUY NHẤT triệt để: ép TensorFlow chạy
+# ĐƠN LUỒNG (bỏ hoàn toàn khả năng chia việc đa luồng → không còn "thứ tự
+# cộng dồn thay đổi được" nữa). ĐÁNH ĐỔI: chậm hơn đáng kể (mất phần lớn lợi
+# ích từ đa nhân CPU) — chấp nhận được ở giai đoạn CHẨN ĐOÁN này vì khả năng
+# tái lập là điều kiện tiên quyết để mọi so sánh ablation sau này có ý nghĩa;
+# có thể tắt lại (single_thread_determinism=False) sau khi đã xác nhận gốc
+# rễ và code xong các cải tiến cần so sánh.
+_SINGLE_THREAD_DETERMINISM = True   # đặt False để lấy lại tốc độ đa luồng
+if _SINGLE_THREAD_DETERMINISM:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+    log.info("[determinism] Đã ép TensorFlow chạy ĐƠN LUỒNG (intra_op=inter_op=1) — "
+             "chậm hơn nhưng loại bỏ hoàn toàn nhiễu thứ tự cộng dồn floating-point "
+             "đa luồng. Đặt _SINGLE_THREAD_DETERMINISM=False để tắt sau khi đã xác "
+             "nhận xong nguồn gốc bất ổn định.")
 
 tf.random.set_seed(42)
 np.random.seed(42)
@@ -199,6 +274,34 @@ class Config:
     alpha_fn:      float = 3.0        # FN penalty (bỏ sót seizure)
     alpha_fp:      float = 1.0        # FP penalty (báo giả)
 
+    # ── I/O tuning cho HDF5 (Xds cache) — ĐÃ THÊM ─────────────────────────────
+    # VẤN ĐỀ đo được thực nghiệm: bản Xds cache (precompute decimate 1 lần)
+    # kỳ vọng giảm CPU nhưng lại làm CHẬM HƠN ~1.7-1.85x/epoch so với bản
+    # không cache (đo trên 6/7 fold, hệ số lặp lại đều đặn → lỗi hệ thống,
+    # không phải nhiễu môi trường). 2 nguyên nhân:
+    #   1) make_generator() đọc TOÀN BỘ batch từ "Xds" RỒI đọc thêm 1 lần nữa
+    #      từ "X" cho phần preictal cần augment — với train set balance 2:1
+    #      (~33% preictal), GẦN NHƯ MỌI batch đều trả kích hoạt đọc kép này
+    #      → lãng phí I/O đọc "Xds" cho các dòng sẽ bị ghi đè ngay sau đó.
+    #      → ĐÃ SỬA: chỉ đọc "Xds" cho phần KHÔNG augment, đọc "X" CHỈ cho
+    #      phần augment — mỗi window giờ chỉ đọc đúng 1 lần từ đúng 1 dataset.
+    #   2) "Xds" tạo với chunks=True (auto-chunk mặc định) — không đảm bảo
+    #      chunk = đúng 1 window, nên 1 lần đọc fancy-index (64 index NGẪU
+    #      NHIÊN do shuffle mỗi epoch) có thể phải load nhiều chunk chồng lấn
+    #      dữ liệu thừa. Tổng dung lượng file cũng tăng thêm ~10GB (Xds) bên
+    #      cạnh X gốc (~21GB) — nếu vượt quá RAM cache của OS, mỗi epoch phải
+    #      seek đĩa lặp lại giữa 2 dataset lớn (cache thrashing).
+    #      → ĐÃ SỬA: chunk "Xds" tường minh = ĐÚNG 1 window/chunk (tối ưu cho
+    #      truy cập ngẫu nhiên theo batch, đánh đổi write throughput lúc
+    #      precompute — chấp nhận được vì chỉ chạy 1 lần).
+    #      → THÊM: tăng h5py raw-data chunk cache (rdcc_nbytes/rdcc_nslots)
+    #      khi mở file để đọc trong generator, giảm số lần evict/re-read
+    #      chunk giữa các batch trong cùng 1 epoch.
+    xds_chunk_rows:   int = 1            # số window/chunk của "Xds" (1 = tối ưu random-read)
+    h5_rdcc_mb:       int = 512          # kích thước raw chunk cache (MB) khi mở file để đọc
+    h5_rdcc_nslots:   int = 1_000_003    # số slot hash cho chunk cache (số nguyên tố, theo khuyến nghị h5py)
+    use_xds_cache:    bool = True        # tắt để quay lại decimate runtime (VD nếu đĩa quá chậm/HDD)
+
     # ── PA1: Firing Power post-processing (thay N/K voting thô) ──────────────
     # Firing power = tỷ lệ window "dương tính" (score ≥ thr_on) trong 1 cửa sổ
     # trượt dài fp_window_s giây gần nhất → mượt hơn N/K voting cũ (vốn chỉ
@@ -221,6 +324,34 @@ class Config:
     # nhau, không thay thế nhau.
     use_calibration: bool = True
 
+    # ── Platt scaling guard — ĐÃ THÊM (fix bug Fold 6: calibration suy biến
+    # khi val mất cân bằng cực đoan, VD chỉ 58/418 window interictal) ────────
+    # VẤN ĐỀ quan sát thực nghiệm: khi 1 lớp trong val quá ít hoặc raw score
+    # không có quan hệ tin cậy với nhãn trên val nhỏ, LogisticRegression vẫn
+    # "fit thành công" (không lỗi) nhưng hội tụ về nghiệm gần-hằng-số (predict
+    # gần bằng tỷ lệ lớp ưu thế cho MỌI input) — VD Fold 6: raw val trải dài
+    # [0.035,0.693] nhưng calibrated lại co cụm [0.847,0.875] (rộng 0.028) →
+    # threshold chọn trên đầu ra suy biến này vô nghĩa hoàn toàn.
+    # SỬA: (1) chặn TRƯỚC khi fit nếu lớp thiểu số quá nhỏ để ước lượng đáng
+    # tin cậy; (2) chặn SAU khi fit nếu dải xác suất hiệu chỉnh trên CHÍNH val
+    # quá hẹp (dấu hiệu trực tiếp của suy biến, không cần đoán nguyên nhân).
+    # Cả 2 trường hợp đều fallback về raw score (giữ đúng thứ hạng, vẫn dùng
+    # được với threshold percentile) thay vì dùng calibration sai lệch.
+    platt_min_class_n:          int   = 30     # số window tối thiểu của lớp THIỂU SỐ trong val
+    platt_min_calibrated_range: float = 0.05   # dải [min,max] tối thiểu của xác suất hiệu chỉnh trên val
+
+    # ── Tách val cho EarlyStopping khỏi val cho threshold/calibration — ĐÃ
+    # THÊM (chống "peeking", Kerr et al. 2024 Front Neurol) ──────────────────
+    # VẤN ĐỀ: val_idx của LOSO-CV (1 seizure file) trước đây dùng CHO CẢ
+    # EarlyStopping (chọn model) LẪN Platt scaling + threshold-selection
+    # (đánh giá/hiệu chỉnh model đã chọn) — đúng lỗi "peeking" kinh điển: mô
+    # hình "tốt nhất" được chọn dựa trên val, rồi lại dùng CHÍNH val đó để
+    # quyết định ngưỡng, không còn dữ liệu độc lập nào để việc chọn ngưỡng là
+    # khách quan. SỬA: trích inner_val_frac% từ TRAIN (không đụng val_idx/
+    # test_idx của LOSO) làm tín hiệu EarlyStopping riêng — val_idx của LOSO
+    # giờ CHỈ dùng cho Platt scaling/threshold, đúng vai trò "unseen" ban đầu.
+    inner_val_frac: float = 0.15   # tỷ lệ train dùng làm inner-val cho EarlyStopping
+
     # ── Threshold selection — ĐÃ BỎ HOÀN TOÀN grid-search trên val ────────────
     # VẤN ĐỀ với grid-search cũ: val của mỗi fold LOSO-CV chỉ có ĐÚNG 1 seizure
     # event → tối ưu trực tiếp Sensitivity/FAR trên val cực dễ đạt "Sens=1.0
@@ -228,8 +359,43 @@ class Config:
     # (bằng chứng thực nghiệm: chb01 Fold 2 AUC=0.904 nhưng threshold chọn trên
     # val làm Sensitivity test=0; chb03 4/7 fold "Sens=1.0" đều đến từ thr_on
     # cực thấp 0.10-0.40 chọn trên val, không phản ánh model thật sự tốt).
-    # → Thay bằng 2 chế độ không nhìn event/nhãn để chọn (xem select_threshold):
-    threshold_mode: str = "relative"   # "absolute" | "relative"
+    # → Thay bằng 3 chế độ không nhìn event/nhãn để chọn (xem select_threshold):
+    #   "absolute" | "relative" | "learn_then_test" (khuyến nghị, xem bên dưới)
+    threshold_mode: str = "learn_then_test"
+
+    # ── Chế độ LEARN_THEN_TEST (Angelopoulos et al. 2022; áp dụng cho seizure
+    # FAR bởi Segal et al. 2023/2025, Frontiers in Neuroscience) — THAY THẾ
+    # percentile thô ("relative") bằng lựa chọn ngưỡng có ĐẢM BẢO THỐNG KÊ
+    # hình thức (finite-sample), thay vì chỉ là điểm ước lượng (point estimate).
+    #
+    # VẤN ĐỀ của "relative" (percentile thô trên interictal): percentile là
+    # ước lượng điểm (point estimate) — KHÔNG có gì đảm bảo risk THẬT (tỷ lệ
+    # interictal vượt ngưỡng trên toàn bộ population) sẽ ≤ target khi mẫu val
+    # nhỏ (58-611 window/fold trong thực nghiệm chb01). Bằng chứng thực
+    # nghiệm: dù đã sửa anchor + sửa bug clamp, FAR vẫn plateau ~1.4-1.6/h
+    # qua 3 công thức percentile khác nhau — percentile đã hết dư địa.
+    #
+    # NGUYÊN LÝ: với mỗi ứng viên thr_on, coi risk(thr_on) = P(score
+    # interictal ≥ thr_on) là 1 đại lượng cần KIỂM ĐỊNH THỐNG KÊ (không phải
+    # chỉ ước lượng), dùng p-value Hoeffding-Bentkus (HB, Bates et al. 2021)
+    # cho loss bị chặn trong [0,1]:
+    #   H0: risk(thr_on) > ltt_target_risk  (ứng viên "TỆ" — không kiểm soát được)
+    #   Bác bỏ H0 (chấp nhận thr_on) khi p_HB ≤ ltt_delta
+    # Do risk(thr_on) ĐƠN ĐIỆU GIẢM khi thr_on tăng, dùng Fixed Sequence
+    # Testing (FST): kiểm định các ứng viên theo thứ tự TỪ BẢO THỦ NHẤT
+    # (thr_on cao, risk≈0, luôn pass) GIẢM DẦN, DỪNG ở ứng viên đầu tiên bị
+    # bác bỏ (p > delta) — chọn ứng viên NỚI NHẤT (thr_on nhỏ nhất) vừa còn
+    # pass. FST kiểm soát đúng family-wise error rate ở mức delta MÀ KHÔNG
+    # CẦN hiệu chỉnh Bonferroni (nhờ tính đơn điệu) — mạnh hơn test độc lập
+    # từng điểm. Đã kiểm chứng bằng Monte Carlo (Beta(2,5), n=300 và n=58 mô
+    # phỏng đúng cỡ mẫu Fold 6 thật): tỷ lệ risk THẬT vượt target luôn ≤
+    # ltt_delta qua hàng trăm lần lặp — percentile thô KHÔNG có đảm bảo này.
+    #
+    # Trade-off: ngưỡng LTT LUÔN ≥ percentile thô tương ứng (dè dặt hơn để bù
+    # sai số ước lượng mẫu nhỏ) → Sensitivity có thể giảm nhẹ ở fold mẫu quá
+    # nhỏ, đổi lấy FAR có đảm bảo thống kê thay vì may rủi.
+    ltt_target_risk: float = 0.03   # risk mục tiêu = tỷ lệ window interictal được PHÉP vượt thr_on
+    ltt_delta:       float = 0.10   # mức tin cậy 1-delta = 90% rằng risk thật <= ltt_target_risk
 
     # Chế độ ABSOLUTE: 1 con số cố định cho MỌI fold. Nhiều nghiên cứu seizure
     # prediction cố định threshold Firing Power thay vì tối ưu (tránh thêm 1
@@ -240,23 +406,41 @@ class Config:
     fixed_thr_on:  float = 0.50
     fixed_thr_off: float = 0.40
 
-    # Chế độ RELATIVE (mặc định, khuyến nghị): percentile của TOÀN BỘ score
-    # val (~vài trăm window, KHÔNG theo event) → tự thích nghi theo thang đo
-    # riêng từng model, không có chỗ "học tủ" theo 1 event như grid-search cũ.
+    # Chế độ RELATIVE (mặc định, khuyến nghị) — ĐÃ SỬA LẦN 2 (anchor đổi từ
+    # "preictal_frac của TOÀN val" → "phân phối điểm số CHỈ trên interictal
+    # của val"):
     #
-    # ĐÃ SỬA (percentile CỐ ĐỊNH 95/90 → percentile TỰ THÍCH NGHI theo tỷ lệ
-    # preictal thật của val): percentile cố định 95/90 giả định preictal chỉ
-    # chiếm ~5-10% val — SAI, vì mỗi file val chỉ dài ~1h trong khi
-    # SOP=1740s(29 phút) → preictal có thể chiếm 40-50% số window trong 1 file
-    # val có seizure (khác hẳn tỷ lệ 0.101 tính trên TOÀN dataset, vốn bị pha
-    # loãng bởi nhiều file interictal-thuần). Bằng chứng thực nghiệm: chb01
-    # Fold 3 AUC-ROC=0.930 (model phân biệt rất tốt) nhưng percentile-95 vẫn
-    # cho Sensitivity=0.000 NGAY TRÊN VAL — vì ngưỡng đòi hỏi score nằm trong
-    # top 5% tuyệt đối, trong khi tỷ lệ preictal thật của file đó cao hơn
-    # nhiều. Sửa: percentile giờ suy ra TỰ ĐỘNG từ preictal_frac = tỷ lệ
-    # window có nhãn y>0 trong val (đếm nhãn — thống kê ổn định trên hàng
-    # trăm window, KHÔNG phải kết quả trúng/trượt 1 event nhị phân, nên vẫn
-    # giữ nguyên tinh thần chống overfit của Fix #1).
+    # VẤN ĐỀ của bản trước (percentile suy từ preictal_frac): preictal_frac
+    # của val dao động CỰC MẠNH giữa các fold — quan sát thực nghiệm chb01:
+    # 0.095 (fold 5) → 0.861 (fold 6), vì val chỉ có ĐÚNG 1 file/1 seizure,
+    # SOP thích ứng + độ dài file khác nhau khiến tỷ lệ này gần như NGẪU
+    # NHIÊN, không phản ánh khả năng phân biệt thật của model:
+    #   - Fold 5: preictal_frac=0.095 (thấp bất thường) → percentile bị đẩy
+    #     lên 90.5 → thr_on quá cao so với score thật của vùng preictal →
+    #     Sensitivity=0.000 trên CẢ VAL LẪN TEST dù AUC-ROC test 0.69-0.93
+    #     (model vẫn phân biệt tốt, chỉ threshold sai).
+    #   - Fold 6: preictal_frac=0.861 (cao bất thường) → percentile chỉ 13.9
+    #     → thr_on quá thấp → FAR test vọt lên 1.66-3.54/h, cao nhất trong
+    #     mọi fold.
+    #
+    # SỬA: percentile giờ tính trên PHÂN PHỐI ĐIỂM SỐ CỦA RIÊNG INTERICTAL
+    # (y_val==0), không còn dùng preictal_frac để suy ra percentile:
+    #   thr_on  = percentile thứ (100 - interictal_fa_pct) của score INTERICTAL
+    #   thr_off = percentile thấp hơn thr_on đúng relative_pct_margin điểm %
+    # Lý do tốt hơn:
+    #   1) Số window interictal LUÔN nhiều (hàng trăm-nghìn) và ổn định giữa
+    #      các fold, không phụ thuộc SOP/độ dài file preictal đặc thù ngẫu
+    #      nhiên như preictal_frac.
+    #   2) Nhắm THẲNG vào đại lượng cần kiểm soát (tỷ lệ interictal vượt
+    #      ngưỡng ≈ nguồn gốc trực tiếp của FAR), thay vì suy luận gián tiếp
+    #      qua tỷ lệ preictal.
+    #   3) Không phụ thuộc độ dài/đặc thù của vùng preictal (vốn là nguồn
+    #      gây lệch ở cả fold 5 và fold 6) → tự động ổn định cho cả 2 case
+    #      cực đoan trên mà KHÔNG cần fold-specific hack.
+    #   4) Vẫn KHÔNG nhìn vào việc trúng/trượt 1 seizure event để chọn
+    #      ngưỡng (chỉ dùng nhãn y==0, là nhãn ổn định, không phải kết quả
+    #      pass/fail) → giữ nguyên tinh thần chống overfit của Fix #1.
+    interictal_fa_pct:   float = 3.0   # % interictal-window val được PHÉP vượt thr_on
     relative_pct_margin: float = 5.0   # khoảng cách (điểm %) giữa pct_on và pct_off
 
 
@@ -788,56 +972,199 @@ def _transform(x: np.ndarray, ds_factor: int) -> np.ndarray:
     return x_ds.transpose(2, 0, 1).reshape(x_ds.shape[2], -1)
 
 
-def _augment_window(x: np.ndarray) -> np.ndarray:
+def _augment_window(x: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
     """
     Augment trên window đã qua multiband-filter + per-window z-normalize
     (shape (n_bands, n_ch, win_s), đây là dữ liệu lấy thẳng từ HDF5["X"] —
     KHÔNG phải tín hiệu EEG thô gốc, dù trước đây docstring ghi nhầm vậy).
+
+    ĐÃ SỬA (nguồn nhiễu không tất định còn sót lại sau enable_op_determinism):
+    trước đây dùng np.random.* (RNG TOÀN CỤC, module-level) — nhưng generator
+    này chạy trong LUỒNG NỀN của .prefetch(tf.data.AUTOTUNE), không đồng bộ
+    với luồng chính. RNG toàn cục KHÔNG thread-safe: thứ tự các lệnh random
+    thực thi phụ thuộc lịch trình hệ điều hành cấp phát CPU cho luồng nền —
+    enable_op_determinism() chỉ kiểm soát op BÊN TRONG đồ thị TensorFlow,
+    KHÔNG kiểm soát code Python/numpy tự viết chạy ngoài đồ thị này. Bằng
+    chứng thực nghiệm: 1 fold (test_file=3) vẫn cho AUC-ROC lệch cực mạnh
+    (0.125 → 0.834 → 0.148) qua 3 lần chạy DÙ đã bật determinism đầy đủ.
+    Sửa: nhận `rng` là 1 np.random.RandomState CỤC BỘ (tạo 1 lần/fold, xem
+    make_generator) — độc lập hoàn toàn với RNG toàn cục và với bất kỳ luồng
+    nào khác trong tiến trình, đảm bảo tái lập đúng bất kể luồng nền chạy
+    lúc nào.
     """
     x = x.copy()
-    op = np.random.randint(4)
+    op = rng.randint(4)
     if op == 0:
-        x += np.random.normal(0, 0.01 * (x.std() + 1e-6), x.shape).astype(np.float32)
+        x += rng.normal(0, 0.01 * (x.std() + 1e-6), x.shape).astype(np.float32)
     elif op == 1:
-        x *= np.float32(np.random.uniform(0.85, 1.15))
+        x *= np.float32(rng.uniform(0.85, 1.15))
     elif op == 2:
-        x = np.roll(x, np.random.randint(-10, 10), axis=2)
+        x = np.roll(x, rng.randint(-10, 10), axis=2)
     elif op == 3:
-        flip = np.random.rand(x.shape[1]) < 0.25
+        flip = rng.rand(x.shape[1]) < 0.25
         x[:, flip, :] *= -1
     return x.astype(np.float32)
 
 
-def make_generator(idx_arr, h5path, cfg, ent_stats: dict, shuffle=True, augment=False):
+def ensure_xds_cache(h5path: str, cfg: Config, time_ds: int, feat_sz: int):
+    """
+    ĐÃ THÊM (tối ưu tốc độ — KHÔNG đổi kết quả số học, chỉ cache):
+    Trước đây _transform() (scipy.decimate zero-phase FIR — phép tính CPU
+    nặng nhất trong generator) bị tính lại cho TOÀN BỘ dataset ở MỌI epoch
+    (30 epoch/fold), dù kết quả deterministic, không đổi cho ~90% window
+    (những window KHÔNG augment — chỉ preictal mới augment mỗi epoch). Hàm
+    này tính _transform() một lần duy nhất cho toàn dataset, lưu vào dataset
+    "Xds" ngay trong file HDF5 hiện có (giữ nguyên "X" gốc để augment
+    preictal vẫn hoạt động y hệt cũ). make_generator() tự phát hiện "Xds":
+    có → dùng fast-path (bỏ qua decimate cho window không augment); chưa có
+    → tự fallback về cách tính cũ, không phá vỡ tương thích ngược.
+    Xds[i] == _transform(X[i], ds_factor) BIT-FOR-BIT (cùng hàm, cùng input)
+    — đây thuần tuý là cache, không phải thay đổi thuật toán/kết quả.
+    Chạy 1 lần cho mỗi file HDF5 (idempotent, tự bỏ qua nếu đã có đủ).
+
+    ĐÃ SỬA (2 lỗi phát hiện sau review):
+    1) Trước đây chỉ kiểm tra hf["Xds"].shape[0]==n để coi là "đã cache" —
+       nếu script bị ngắt giữa chừng (crash/mất điện/Ctrl+C) lúc đang ghi,
+       shape[0] đã đúng ngay từ create_dataset() dù dữ liệu bên trong còn
+       rỗng/rác → lần chạy sau sẽ ÂM THẦM dùng dữ liệu rác mà không báo gì.
+       → Sửa: chỉ coi cache hợp lệ khi có attrs["xds_complete"]=True, được
+       set DUY NHẤT sau khi ghi xong TOÀN BỘ các chunk.
+    2) Trước đây không kiểm tra time_ds/feat_sz/ds_factor dùng lúc tính Xds
+       — nếu sau này đổi cfg.ds_factor hoặc số băng tần mà không xoá file
+       .h5, cache cũ (tính với config cũ) vẫn bị tái sử dụng sai.
+       → Sửa: lưu (ds_factor, time_ds, feat_sz) vào attrs lúc tính xong,
+       so khớp với config hiện tại trước khi chấp nhận cache.
+
+    ĐÃ SỬA LẦN 2 (hiệu năng I/O — xem giải thích đầy đủ ở Config):
+    3) chunks=True (auto-chunk) → chunks=(cfg.xds_chunk_rows, time_ds,
+       feat_sz), mặc định 1 window/chunk — tối ưu cho pattern đọc NGẪU NHIÊN
+       theo batch (shuffle mỗi epoch), tránh đọc thừa dữ liệu ngoài batch.
+    4) Nếu cfg.use_xds_cache=False: xoá cache cũ (nếu có) và KHÔNG precompute
+       — generator/load_split sẽ tự fallback về decimate runtime (hành vi
+       của bản trước Xds), dùng khi đĩa quá chậm khiến I/O cache thua CPU.
+    """
+    if not cfg.use_xds_cache:
+        with h5py.File(h5path, "a") as hf:
+            if "Xds" in hf:
+                log.info("use_xds_cache=False — xoá Xds cache hiện có, quay lại decimate runtime.")
+                del hf["Xds"]
+        return
+
+    with h5py.File(h5path, "a") as hf:
+        n = hf["X"].shape[0]
+        cache_ok = (
+            "Xds" in hf
+            and hf["Xds"].shape == (n, time_ds, feat_sz)
+            and hf["Xds"].attrs.get("xds_complete", False)
+            and hf["Xds"].attrs.get("ds_factor", None) == cfg.ds_factor
+            and hf["Xds"].chunks == (cfg.xds_chunk_rows, time_ds, feat_sz)
+        )
+        if cache_ok:
+            log.info(f"Xds cache đã có sẵn & hợp lệ ({n} windows, chunk={hf['Xds'].chunks}) "
+                     f"— bỏ qua bước precompute.")
+            return
+        if "Xds" in hf:
+            log.warning("Xds cache cũ không hợp lệ/không đầy đủ/lệch chunk shape "
+                        "(dở dang hoặc lệch config) — tính lại từ đầu.")
+            del hf["Xds"]
+        chunk_shape = (cfg.xds_chunk_rows, time_ds, feat_sz)
+        ds = hf.create_dataset("Xds", shape=(n, time_ds, feat_sz), dtype="float32",
+                                chunks=chunk_shape)
+        ds.attrs["xds_complete"] = False   # chỉ bật True sau khi ghi xong toàn bộ
+        ds.attrs["ds_factor"]    = cfg.ds_factor
+
+        chunk = 256  # kích thước batch GHI (sequential) — không liên quan chunk ĐỌC ở trên
+        t0 = time.time()
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            Xb = hf["X"][start:end]
+            Xt = np.stack([_transform(x, cfg.ds_factor) for x in Xb]).astype(np.float32)
+            hf["Xds"][start:end] = Xt
+            if (start // chunk) % 20 == 0:
+                log.info(f"  precompute Xds: {end}/{n} ({100*end/n:.0f}%)")
+        hf["Xds"].attrs["xds_complete"] = True   # đánh dấu hoàn tất — chỉ set ở đây
+        log.info(f"Precompute Xds hoàn tất: {n} windows (chunk={chunk_shape}) trong "
+                 f"{(time.time()-t0)/60:.1f} phút (chỉ chạy 1 LẦN — các lần chạy sau tự bỏ qua).")
+
+
+def make_generator(idx_arr, h5path, cfg, ent_stats: dict, shuffle=True, augment=False, seed=0):
     """
     ent_stats: dict {"SE": (med, iqr), "SPE": (med, iqr), "PE": (med, iqr)}
     PHẢI được tính từ compute_entropy_norm_stats(h5path, train_idx_của_fold_này)
     — KHÔNG dùng chung stats giữa các fold, KHÔNG tính trên val/test.
+
+    ĐÃ SỬA (hiệu năng I/O — xem giải thích đầy đủ ở Config): trước đây khi
+    có Xds cache, code đọc TOÀN BỘ batch từ "Xds" RỒI đọc thêm 1 lần nữa từ
+    "X" cho phần preictal augment — với train set balance 2:1 (~33% preictal)
+    GẦN NHƯ MỌI batch train đều kích hoạt đọc kép này, đo thực nghiệm làm
+    chậm hơn ~1.7-1.85x/epoch so với bản KHÔNG có Xds (ngược hoàn toàn mục
+    tiêu ban đầu). Sửa: dùng boolean mask tách batch thành 2 nhóm KHÔNG
+    CHỒNG LẤN — nhóm augment đọc từ "X", nhóm còn lại đọc từ "Xds" — mỗi
+    window giờ chỉ đọc ĐÚNG 1 LẦN từ ĐÚNG 1 dataset.
+
+    ĐÃ SỬA (nguồn nhiễu không tất định còn sót — xem docstring _augment_window):
+    `seed` khởi tạo 1 np.random.RandomState CỤC BỘ, tạo ĐÚNG 1 LẦN ở đây
+    (ngoài def gen()) — nhờ closure, trạng thái RNG này TỰ TIẾN TRIỂN qua
+    các lần gen() được gọi lại (mỗi epoch, do .repeat()), nên vẫn shuffle
+    khác nhau mỗi epoch như cũ, nhưng độc lập hoàn toàn với RNG toàn cục
+    (np.random.*) — không còn bị nhiễu bởi luồng nền .prefetch(AUTOTUNE)
+    hay bất kỳ code nào khác trong tiến trình. Gọi make_generator lại từ
+    đầu (VD chạy lại fold) với cùng `seed` → cùng chuỗi shuffle/augment,
+    tái lập hoàn toàn.
     """
     idx_arr = np.array(idx_arr)
     se_med, se_iqr   = ent_stats["SE"]
     spe_med, spe_iqr = ent_stats["SPE"]
     pe_med, pe_iqr   = ent_stats["PE"]
+    rng = np.random.RandomState(seed)   # cục bộ, không phụ thuộc np.random toàn cục
 
     def gen():
-        order = np.random.permutation(len(idx_arr)) if shuffle else np.arange(len(idx_arr))
-        # Mở h5py 1 lần / epoch (không mở lại từng batch — tối ưu từ v4)
-        with h5py.File(h5path, "r") as hf:
+        order = rng.permutation(len(idx_arr)) if shuffle else np.arange(len(idx_arr))
+        # Mở h5py 1 lần / epoch (không mở lại từng batch — tối ưu từ v4).
+        # rdcc_nbytes/rdcc_nslots tăng so với mặc định (1MB/521 slot) để
+        # giảm evict/re-read chunk khi truy cập NGẪU NHIÊN (shuffle) trong
+        # cùng 1 epoch — xem giải thích ở Config.
+        with h5py.File(h5path, "r", rdcc_nbytes=cfg.h5_rdcc_mb * 1024 * 1024,
+                        rdcc_nslots=cfg.h5_rdcc_nslots) as hf:
+            has_xds = "Xds" in hf
+            xds_shape = hf["Xds"].shape[1:] if has_xds else None
             for start in range(0, len(order), cfg.batch_size):
                 pos = idx_arr[order[start: start + cfg.batch_size]]
                 uid, inv = np.unique(pos, return_inverse=True)
-                Xb   = hf["X"][uid][inv]
                 SEb  = apply_entropy_norm_stats(hf["SE"][uid][inv],  se_med,  se_iqr)
                 SPEb = apply_entropy_norm_stats(hf["SPE"][uid][inv], spe_med, spe_iqr)
                 PEb  = apply_entropy_norm_stats(hf["PE"][uid][inv],  pe_med,  pe_iqr)
                 yb   = hf["y"][uid][inv]
+                pre_mask = (yb > 0) if augment else np.zeros_like(yb, dtype=bool)
 
-                if augment:
-                    pre_idx = np.where(yb > 0)[0]
-                    for i in pre_idx:
-                        Xb[i] = _augment_window(Xb[i])
+                if has_xds:
+                    keep_mask = ~pre_mask
+                    Xt = np.empty((len(pos),) + xds_shape, dtype=np.float32)
+                    if keep_mask.any():
+                        # Chỉ đọc "Xds" cho phần KHÔNG augment — không còn
+                        # đọc rồi ghi đè lãng phí như trước.
+                        k_uid, k_inv = np.unique(pos[keep_mask], return_inverse=True)
+                        Xt[keep_mask] = hf["Xds"][k_uid][k_inv].astype(np.float32)
+                    if pre_mask.any():
+                        # Preictal cần augment: augment thay đổi tín hiệu
+                        # ngẫu nhiên mỗi epoch nên KHÔNG dùng được cache —
+                        # đọc "X" thô + decimate lại, y hệt logic cũ, nhưng
+                        # giờ CHỈ đọc phần này (không đọc trùng ở "Xds" nữa).
+                        idxs = np.where(pre_mask)[0]
+                        r_uid, r_inv = np.unique(pos[idxs], return_inverse=True)
+                        Xb_raw = hf["X"][r_uid][r_inv]
+                        for k, i in enumerate(idxs):
+                            xa = _augment_window(Xb_raw[k], rng)
+                            Xt[i] = _transform(xa, cfg.ds_factor)
+                else:
+                    # Fallback cũ — dùng khi use_xds_cache=False hoặc chưa
+                    # chạy ensure_xds_cache().
+                    Xb = hf["X"][uid][inv]
+                    if pre_mask.any():
+                        for i in np.where(pre_mask)[0]:
+                            Xb[i] = _augment_window(Xb[i], rng)
+                    Xt = np.stack([_transform(x, cfg.ds_factor) for x in Xb]).astype(np.float32)
 
-                Xt = np.stack([_transform(x, cfg.ds_factor) for x in Xb]).astype(np.float32)
                 # Entropy: concat SE+SPE+PE → (B, 3*n_ch)
                 Et = np.concatenate([SEb, SPEb, PEb], axis=1).astype(np.float32)
                 yield {"temporal": Xt, "entropy": Et}, yb.astype(np.float32)
@@ -862,8 +1189,16 @@ def load_split_to_memory(idx, h5path, cfg, ent_stats: dict):
     pe_med, pe_iqr   = ent_stats["PE"]
 
     idx_s = np.sort(idx)
-    with h5py.File(h5path, "r") as hf:
-        Xb   = hf["X"][idx_s]
+    with h5py.File(h5path, "r", rdcc_nbytes=cfg.h5_rdcc_mb * 1024 * 1024,
+                    rdcc_nslots=cfg.h5_rdcc_nslots) as hf:
+        # Dùng cache Xds nếu có (val/test không augment nên luôn dùng được
+        # trực tiếp, không cần điều kiện gì thêm) — bit-for-bit giống
+        # _transform(X, ds_factor), chỉ tránh tính lại decimate.
+        if "Xds" in hf:
+            Xt = hf["Xds"][idx_s].astype(np.float32)
+        else:
+            Xb = hf["X"][idx_s]
+            Xt = np.stack([_transform(x, cfg.ds_factor) for x in Xb]).astype(np.float32)
         SEb  = apply_entropy_norm_stats(hf["SE"][idx_s],  se_med,  se_iqr)
         SPEb = apply_entropy_norm_stats(hf["SPE"][idx_s], spe_med, spe_iqr)
         PEb  = apply_entropy_norm_stats(hf["PE"][idx_s],  pe_med,  pe_iqr)
@@ -871,7 +1206,6 @@ def load_split_to_memory(idx, h5path, cfg, ent_stats: dict):
         ttsb = hf["tts"][idx_s]
         tb   = hf["t"][idx_s]
         fidb = hf["file_id"][idx_s]
-    Xt = np.stack([_transform(x, cfg.ds_factor) for x in Xb]).astype(np.float32)
     Et = np.concatenate([SEb, SPEb, PEb], axis=1).astype(np.float32)
     return Xt, Et, yb.astype(np.float32), ttsb.astype(np.float32), tb.astype(np.float32), fidb.astype(np.int32)
 
@@ -1187,7 +1521,7 @@ def metrics_grouped(y_true, scores, tts_arr, file_ids, voter, thr_on, thr_off, c
     }
 
 
-def fit_platt_scaling(val_scores: np.ndarray, y_val: np.ndarray):
+def fit_platt_scaling(val_scores: np.ndarray, y_val: np.ndarray, cfg: "Config" = None):
     """
     Platt scaling (Platt, 1999) — hiệu chỉnh xác suất TRƯỚC khi threshold.
 
@@ -1211,25 +1545,115 @@ def fit_platt_scaling(val_scores: np.ndarray, y_val: np.ndarray):
     hình học ngược — khi đó calibration phản ánh đúng thực tế đó, không
     phải lỗi).
 
-    Trả về callable calibrate(scores)->calibrated_scores, hoặc None nếu val
-    chỉ có 1 lớp (không thể fit logistic regression — fallback dùng raw
-    score, có log cảnh báo ở nơi gọi).
+    ĐÃ SỬA (guard chống calibration suy biến — xem giải thích đầy đủ ở
+    Config): trả về (calibrate_fn, reason) thay vì chỉ calibrate_fn — nếu
+    guard chặn, calibrate_fn=None và reason ghi rõ LÝ DO cụ thể (để log ở
+    nơi gọi thay vì thông báo chung chung "1 lớp").
     """
     y_bin = (y_val > 0).astype(int)
-    if len(np.unique(y_bin)) < 2:
-        return None
+    n_pos = int(y_bin.sum())
+    n_neg = int(len(y_bin) - n_pos)
+    min_class_n = cfg.platt_min_class_n          if cfg is not None else 30
+    min_range   = cfg.platt_min_calibrated_range if cfg is not None else 0.05
+
+    if n_pos == 0 or n_neg == 0:
+        return None, "val chỉ có 1 lớp (toàn preictal hoặc toàn interictal)"
+    if min(n_pos, n_neg) < min_class_n:
+        return None, (f"lớp thiểu số chỉ có {min(n_pos, n_neg)} window "
+                       f"(< ngưỡng tối thiểu {min_class_n}) — không đủ để ước lượng "
+                       f"hồi quy logistic đáng tin cậy")
+
     lr = LogisticRegression(solver="lbfgs")
     lr.fit(val_scores.reshape(-1, 1), y_bin)
+
+    # Guard SAU khi fit: kiểm tra ngay trên CHÍNH val xem calibration có suy
+    # biến không (dải xác suất đầu ra quá hẹp = model không tìm được quan hệ
+    # tin cậy giữa raw score và nhãn trên val fold này, bất kể nguyên nhân
+    # cụ thể là gì — separable data, mất cân bằng cực đoan, hay val quá nhiễu).
+    calibrated_val = lr.predict_proba(val_scores.reshape(-1, 1))[:, 1]
+    cal_range = float(calibrated_val.max() - calibrated_val.min())
+    if cal_range < min_range:
+        return None, (f"calibration suy biến: dải xác suất hiệu chỉnh trên val chỉ "
+                       f"rộng {cal_range:.3f} (< ngưỡng tối thiểu {min_range}) — model "
+                       f"không tìm được quan hệ tin cậy giữa raw score và nhãn trên val "
+                       f"fold này (val: {n_pos} preictal / {n_neg} interictal)")
 
     def calibrate(scores: np.ndarray) -> np.ndarray:
         return lr.predict_proba(scores.reshape(-1, 1))[:, 1]
 
-    return calibrate
+    return calibrate, None
+
+
+def hb_pvalue(r_hat: float, n: int, alpha: float) -> float:
+    """
+    p-value Hoeffding-Bentkus (HB) cho kiểm định H0: risk THẬT > alpha, với
+    loss bị chặn trong [0,1] và n mẫu i.i.d — dùng trong Learn-Then-Test
+    (Angelopoulos, Bates, Candès et al. 2022; áp dụng cho seizure FAR bởi
+    Segal et al. 2023/2025). p_HB nhỏ ⇒ bằng chứng MẠNH rằng risk thật ≤
+    alpha (bác bỏ H0 "risk tệ") — NGƯỢC với p-value thông thường của việc
+    "muốn chứng minh".
+
+    r_hat: risk quan sát được (VD tỷ lệ window interictal có score ≥ thr_on)
+    n:     cỡ mẫu dùng ước lượng r_hat
+    alpha: mức risk mục tiêu muốn kiểm soát
+
+    Công thức: p_HB = min(1, e·P[Binomial(n,alpha) ≤ ⌈n·r̂⌉], exp(-n·h1(r̂∧α,α)))
+    trong đó h1(a,b) là KL-divergence nhị phân D(a‖b). Kết hợp Bentkus
+    (chặt hơn khi n nhỏ) và Hoeffding (chặt hơn khi n lớn) — dùng cái nhỏ
+    hơn (chặt hơn) trong 2 chặn.
+    """
+    if r_hat >= alpha:
+        return 1.0   # risk quan sát đã vượt alpha — không có bằng chứng risk thật <= alpha
+    bentkus_p = np.e * float(scipy_binom.cdf(np.ceil(n * r_hat), n, alpha))
+
+    def _h1(a, b):
+        a = np.clip(a, 1e-12, 1 - 1e-12)
+        b = np.clip(b, 1e-12, 1 - 1e-12)
+        return a * np.log(a / b) + (1 - a) * np.log((1 - a) / (1 - b))
+
+    hoeffding_p = float(np.exp(-n * _h1(min(r_hat, alpha), alpha)))
+    return float(min(1.0, bentkus_p, hoeffding_p))
+
+
+def select_threshold_ltt(inter_scores: np.ndarray, alpha: float, delta: float):
+    """
+    Learn-Then-Test bằng Fixed Sequence Testing (FST) — chọn thr_on NHỎ NHẤT
+    (nới nhất, tối đa hoá Sensitivity) sao cho vẫn có đảm bảo thống kê
+    P(risk_thật(thr_on) ≤ alpha) ≥ 1-delta.
+
+    Vì risk(thr_on) = P(score_interictal ≥ thr_on) ĐƠN ĐIỆU GIẢM theo
+    thr_on, FST kiểm định các ứng viên theo thứ tự TỪ BẢO THỦ NHẤT (risk≈0,
+    luôn pass) GIẢM DẦN, dừng ở ứng viên đầu tiên bị bác bỏ — kiểm soát đúng
+    family-wise error rate ở mức delta MÀ KHÔNG cần hiệu chỉnh Bonferroni
+    (mạnh hơn kiểm định độc lập từng điểm rất nhiều khi grid lớn).
+
+    Trả về (thr_on_chosen, n_candidates_tested, n_accepted).
+    """
+    n = len(inter_scores)
+    if n == 0:
+        return float("inf"), 0, 0   # không có dữ liệu — an toàn tuyệt đối, không bao giờ alarm
+
+    sorted_desc = np.sort(np.unique(inter_scores))[::-1]
+    # Thêm 1 ứng viên "an toàn tuyệt đối" ở đầu (risk=0 chắc chắn) để FST
+    # luôn có điểm khởi đầu hợp lệ trước khi thử các giá trị quan sát được.
+    candidates = np.concatenate([[sorted_desc[0] + 1e-6], sorted_desc])
+
+    best = candidates[0]
+    n_accepted = 0
+    for i, c in enumerate(candidates):
+        r_hat = float(np.mean(inter_scores >= c))
+        p = hb_pvalue(r_hat, n, alpha)
+        if p <= delta:
+            best = c
+            n_accepted = i + 1
+        else:
+            break
+    return float(best), len(candidates), n_accepted
 
 
 def select_threshold(y_val, val_scores, val_tts, val_fids, voter, cfg, val_t=None):
     """
-    Chọn (thr_on, thr_off) cho fold hiện tại — 2 chế độ, KHÔNG bao giờ nhìn
+    Chọn (thr_on, thr_off) cho fold hiện tại — 3 chế độ, KHÔNG bao giờ nhìn
     vào nhãn/event của val để chọn threshold (loại bỏ hoàn toàn nguồn overfit
     của grid-search cũ, vốn tối ưu trực tiếp Sensitivity/FAR trên val chỉ có
     ĐÚNG 1 seizure event → cực dễ "học tủ" 1 điểm, không generalize sang test).
@@ -1243,20 +1667,37 @@ def select_threshold(y_val, val_scores, val_tts, val_fids, voter, cfg, val_t=Non
        fold) → nhiều fold model gần như không bao giờ vượt ngưỡng, mất alarm
        hoàn toàn dù model vẫn phân biệt được (AUC vẫn ổn).
 
-    2. RELATIVE (cfg.threshold_mode="relative", mặc định):
-       Percentile TỰ THÍCH NGHI theo tỷ lệ preictal thật của val — thay vì
-       percentile cố định (VD 95/90, giả định preictal luôn ~5-10% val — SAI
-       vì mỗi file val chỉ dài ~1h trong khi SOP=1740s có thể chiếm 40-50% số
-       window của file đó). Công thức:
-           preictal_frac = tỷ lệ window val có nhãn y > 0   (đếm nhãn, KHÔNG
-                            phải kết quả trúng/trượt 1 event → vẫn là thống kê
-                            ổn định trên hàng trăm window, không "học tủ")
-           pct_on  = 100 * (1 - preictal_frac)
-           pct_off = pct_on - cfg.relative_pct_margin
-       → threshold tự thích nghi CẢ theo thang đo score riêng từng model LẪN
-       theo mật độ preictal thật của từng fold, mà vẫn không dùng event
-       pass/fail để chọn.
+    2. RELATIVE (cfg.threshold_mode="relative", mặc định) — ĐÃ SỬA LẦN 2:
+       Percentile tính trên PHÂN PHỐI ĐIỂM SỐ CỦA RIÊNG INTERICTAL trong val
+       (y_val==0), KHÔNG còn suy từ preictal_frac (tỷ lệ preictal của toàn
+       val — dao động ngẫu nhiên 0.095→0.861 giữa các fold do val chỉ có 1
+       file/1 seizure, gây threshold lệch cực đoan — xem chi tiết ở Config).
+       Công thức:
+           thr_on  = percentile thứ (100 - cfg.interictal_fa_pct) của score
+                     TRÊN CÁC WINDOW INTERICTAL (y_val==0) — tức chỉ cho phép
+                     ~interictal_fa_pct% window interictal của val vượt ngưỡng.
+           thr_off = percentile thấp hơn thr_on đúng relative_pct_margin điểm %
+                     (tính trên CÙNG phân phối interictal).
+       Neo vào lớp interictal (luôn nhiều, ổn định) thay vì tỷ lệ preictal
+       (ít, biến động mạnh theo SOP/độ dài file) → threshold không còn bị kéo
+       lệch cực đoan bởi đặc thù ngẫu nhiên của 1 file val.
     """
+    # ĐÃ THÊM: log chẩn đoán phân phối score INTERICTAL riêng (không phải
+    # toàn val như dòng "Platt scaling fit+apply" đã có) — mục đích: lần sau
+    # gặp fold nào bị "kẹt sàn" (thr_on luôn trùng đúng thr_off_min+gap bất
+    # kể đổi thuật toán, như Fold 3/test_file=15 đã quan sát 3 lần liên
+    # tiếp), có ngay dữ liệu để xác nhận nguyên nhân là interictal-score bị
+    # nén gần 0 mà KHÔNG cần đoán hay yêu cầu chạy lại lấy thêm log.
+    _inter_diag = val_scores[y_val == 0]
+    if len(_inter_diag) > 0:
+        log.info(f"  [diag] Interictal score (val, n={len(_inter_diag)}): "
+                 f"min={_inter_diag.min():.4f} p50={np.median(_inter_diag):.4f} "
+                 f"p97={np.percentile(_inter_diag,97):.4f} max={_inter_diag.max():.4f} "
+                 f"std={_inter_diag.std():.4f}"
+                 + (" — CẢNH BÁO: phân phối nén gần 0 (p97<thr_off_min+0.02), mọi "
+                    "thuật toán threshold sẽ bị sàn cứng chi phối, không phải lỗi "
+                    "thuật toán" if np.percentile(_inter_diag, 97) < cfg.thr_off_min + 0.02 else ""))
+
     if cfg.threshold_mode == "absolute":
         thr_on, thr_off = cfg.fixed_thr_on, cfg.fixed_thr_off
         m_val = metrics_grouped(y_val, val_scores, val_tts, val_fids, voter, thr_on, thr_off, cfg, t=val_t)
@@ -1266,28 +1707,84 @@ def select_threshold(y_val, val_scores, val_tts, val_fids, voter, cfg, val_t=Non
         return thr_on, thr_off
 
     elif cfg.threshold_mode == "relative":
-        preictal_frac = float(np.mean(y_val > 0))
-        # Kẹp trong [0.5, 99.5] để tránh percentile suy biến ở 2 đầu mút (VD
-        # val gần như toàn preictal hoặc gần như không có preictal nào).
-        pct_on  = float(np.clip(100.0 * (1.0 - preictal_frac), 0.5, 99.5))
+        inter_scores = val_scores[y_val == 0]
+
+        # Fallback an toàn: val không có (hoặc quá ít) window interictal để
+        # ước lượng percentile đáng tin cậy → quay lại percentile trên TOÀN
+        # BỘ val (hành vi cũ) thay vì crash/percentile vô nghĩa trên mảng rỗng.
+        MIN_INTER = 30
+        if len(inter_scores) < MIN_INTER:
+            log.warning(f"  Threshold RELATIVE: val chỉ có {len(inter_scores)} window "
+                        f"interictal (< {MIN_INTER}) — không đủ để ước lượng percentile "
+                        f"tin cậy trên riêng interictal. Fallback: percentile trên TOÀN "
+                        f"BỘ val (hành vi cũ, kém ổn định hơn nhưng an toàn hơn mảng rỗng).")
+            inter_scores = val_scores
+
+        pct_on  = float(np.clip(100.0 - cfg.interictal_fa_pct, 0.5, 99.5))
         pct_off = float(np.clip(pct_on - cfg.relative_pct_margin, 0.5, pct_on - 0.01))
 
-        thr_on  = float(np.percentile(val_scores, pct_on))
-        thr_off = float(np.percentile(val_scores, pct_off))
-        # An toàn: đảm bảo vẫn thỏa hysteresis (thr_off < thr_on) và sàn tối
-        # thiểu thr_off_min, phòng trường hợp percentile suy biến (VD score
-        # gần như hằng số trên val làm 2 percentile trùng/lệch nhau).
-        thr_off = max(cfg.thr_off_min, min(thr_off, thr_on - 0.01))
+        thr_on  = float(np.percentile(inter_scores, pct_on))
+        thr_off = float(np.percentile(inter_scores, pct_off))
+        # ĐÃ SỬA (bug phát hiện qua đối chiếu 2 lần chạy thật — Fold 3/test_file=15
+        # ra thr_on=0.0077 < thr_off=0.02 ở CẢ 2 lần chạy, đảo ngược hysteresis):
+        # công thức clamp cũ `max(thr_off_min, min(thr_off, thr_on-0.01))` chỉ đảm
+        # bảo SÀN cho thr_off, KHÔNG đảm bảo thr_off < thr_on khi chính thr_on đã
+        # nhỏ hơn thr_off_min (trường hợp interictal score của fold đó bị Platt
+        # scaling nén gần 0) — hệ quả: thr_off > thr_on, alarm dễ tắt hơn dễ bật,
+        # gây flicker liên tục → FAR bùng nổ (Fold 3: 11-13 FA-episode, ~3-3.5/h,
+        # cao vượt trội mọi fold khác, tái lập y hệt cả 2 lần chạy — không phải
+        # nhiễu). SỬA: đảm bảo THỨ TỰ trước, sàn giá trị sau — nâng thr_on lên tối
+        # thiểu (thr_off_min + gap) TRƯỚC, rồi kẹp thr_off vào đúng khoảng
+        # [thr_off_min, thr_on-gap] — không bao giờ có thể đảo ngược nữa.
+        _gap = 0.01
+        thr_on  = max(thr_on, cfg.thr_off_min + _gap)
+        thr_off = float(np.clip(thr_off, cfg.thr_off_min, thr_on - _gap))
         m_val = metrics_grouped(y_val, val_scores, val_tts, val_fids, voter, thr_on, thr_off, cfg, t=val_t)
-        log.info(f"  Threshold RELATIVE tự thích nghi: preictal_frac={preictal_frac:.3f} "
+        log.info(f"  Threshold RELATIVE (anchor=interictal): {len(inter_scores)} window interictal "
                  f"→ percentile {pct_on:.1f}/{pct_off:.1f} → thr_on={thr_on:.3f} thr_off={thr_off:.3f} "
                  f"(val ref: Sens={m_val['sensitivity']:.3f} FAR={m_val['far_per_h']:.3f}/h — "
-                 f"percentile tính trên toàn bộ {len(val_scores)} window, không dùng event để chọn)")
+                 f"percentile tính trên score INTERICTAL, không dùng event để chọn)")
+        return thr_on, thr_off
+
+    elif cfg.threshold_mode == "learn_then_test":
+        inter_scores = val_scores[y_val == 0]
+
+        MIN_INTER = 10   # LTT vẫn hoạt động đúng ở mẫu nhỏ (đã kiểm chứng n=58
+                          # bằng Monte Carlo) nên sàn thấp hơn "relative"; dưới
+                          # 10 thì không còn đủ để tính risk có ý nghĩa.
+        if len(inter_scores) < MIN_INTER:
+            log.warning(f"  Threshold LEARN_THEN_TEST: val chỉ có {len(inter_scores)} "
+                        f"window interictal (< {MIN_INTER}) — không đủ để kiểm định. "
+                        f"Fallback: percentile trên TOÀN BỘ val (hành vi 'relative' cũ).")
+            inter_scores = val_scores
+
+        thr_on, n_tested, n_accepted = select_threshold_ltt(
+            inter_scores, alpha=cfg.ltt_target_risk, delta=cfg.ltt_delta)
+
+        # thr_off: cùng công thức margin theo percentile-rank như "relative",
+        # áp dụng SAU khi đã có thr_on (đã có đảm bảo thống kê) — vẫn dùng
+        # ĐÚNG thứ tự clamp đã sửa (nâng sàn thr_on trước, kẹp thr_off sau)
+        # để không tái phát bug đảo ngược hysteresis đã phát hiện ở "relative".
+        rank_on = float(np.mean(inter_scores <= thr_on)) * 100.0   # percentile-rank của thr_on
+        pct_off = float(np.clip(rank_on - cfg.relative_pct_margin, 0.5, rank_on - 0.01))
+        thr_off = float(np.percentile(inter_scores, pct_off)) if len(inter_scores) > 0 else cfg.thr_off_min
+
+        _gap = 0.01
+        thr_on  = max(thr_on, cfg.thr_off_min + _gap)
+        thr_off = float(np.clip(thr_off, cfg.thr_off_min, thr_on - _gap))
+
+        m_val = metrics_grouped(y_val, val_scores, val_tts, val_fids, voter, thr_on, thr_off, cfg, t=val_t)
+        log.info(f"  Threshold LEARN_THEN_TEST: {len(inter_scores)} window interictal, "
+                 f"target_risk={cfg.ltt_target_risk:.2f} delta={cfg.ltt_delta:.2f} "
+                 f"→ {n_accepted}/{n_tested} ứng viên pass FST → thr_on={thr_on:.3f} "
+                 f"thr_off={thr_off:.3f} (đảm bảo thống kê: P(risk thật ≤ {cfg.ltt_target_risk:.2f}) "
+                 f"≥ {1-cfg.ltt_delta:.0%}) (val ref: Sens={m_val['sensitivity']:.3f} "
+                 f"FAR={m_val['far_per_h']:.3f}/h)")
         return thr_on, thr_off
 
     else:
         raise ValueError(f"cfg.threshold_mode='{cfg.threshold_mode}' không hợp lệ "
-                          f"(chỉ chấp nhận 'absolute' hoặc 'relative').")
+                          f"(chỉ chấp nhận 'absolute', 'relative', hoặc 'learn_then_test').")
 
 
 # ── 10. LOSO-CV FRAMEWORK ─────────────────────────────────────────────────────
@@ -1301,32 +1798,63 @@ def get_seizure_file_ids(file_ids, y_all):
 def generate_loso_folds(file_ids, y_all):
     """
     Sinh N folds cho LOSO-CV.
-    fold_i: test  = seizure_file[i]
+    fold_i: test  = seizure_file[i]  +  1 nhóm nhỏ file interictal THUẦN
+                     (không có seizure nào) — chỉ để đo FAR đáng tin cậy hơn,
+                     KHÔNG ảnh hưởng Sensitivity (các file này không có event).
             val   = seizure_file[(i+1) % N]   (for threshold grid-search)
             train = tất cả còn lại
+
+    ĐÃ SỬA (FAR mỗi fold không đáng tin): trước đây test mỗi fold CHỈ có 1
+    seizure file → phần interictal "sạch" còn lại trong đúng file đó (sau khi
+    loại preictal/ictal/post-ictal) có thể rất ít (VD fold 7: 0.1h) → 1 báo
+    động giả ngẫu nhiên cũng làm FAR nhảy vọt vô nghĩa. Trong khi đó ~20 file
+    interictal-thuần của dataset chưa BAO GIỜ được dùng để đánh giá — chỉ nằm
+    trong train.
+    Cách sửa: chia đều các file interictal-thuần thành N nhóm (round-robin),
+    mỗi fold nhận 1 nhóm nhỏ để CỘNG THÊM vào test (chỉ dùng tính FAR — không
+    có seizure nên không đóng góp gì cho Sensitivity). Các file trong nhóm đó
+    bị loại khỏi train CHỈ của fold được gán (giống hệt cách test_fid/val_fid
+    vốn đã bị loại) — không train lại gì thêm, không thêm epoch, nên hầu như
+    không tăng thời gian train. Chi phí tăng thêm chỉ là 1 lượt forward-pass
+    (inference, không backprop) trên vài file thuần lúc evaluate test → rẻ.
     """
-    sz_files  = get_seizure_file_ids(file_ids, y_all)
-    all_files = np.unique(file_ids)
+    sz_files   = get_seizure_file_ids(file_ids, y_all)
+    all_files  = np.unique(file_ids)
+    pure_files = [f for f in all_files if f not in sz_files]   # file interictal-thuần
     N = len(sz_files)
 
     if N < 2:
         raise ValueError(f"LOSO-CV cần ≥ 2 seizure files. Hiện có: {N}. "
                          f"Kiểm tra lại preprocessing / dataset path.")
 
+    # Round-robin chia pure_files thành N nhóm, mỗi fold 1 nhóm nhỏ (~len/N
+    # file) — KHÔNG dồn hết 20 file vào 1 fold để tránh test/train lệch quá
+    # nhiều giữa các fold.
+    pure_groups = [[] for _ in range(N)]
+    for k, pf in enumerate(pure_files):
+        pure_groups[k % N].append(pf)
+
     folds = []
     for i, test_fid in enumerate(sz_files):
-        val_fid = sz_files[(i + 1) % N]
-        train_fids = [f for f in all_files if f != test_fid and f != val_fid]
+        val_fid    = sz_files[(i + 1) % N]
+        extra_pure = pure_groups[i]                      # file thuần gán cho fold này
+        excluded   = {test_fid, val_fid, *extra_pure}
+        train_fids = [f for f in all_files if f not in excluded]
+        test_fids_all = [test_fid, *extra_pure]
 
         folds.append({
-            "fold":        i,
-            "test_fid":    test_fid,
-            "val_fid":     val_fid,
-            "train_idx":   np.where(np.isin(file_ids, train_fids))[0],
-            "val_idx":     np.where(file_ids == val_fid)[0],
-            "test_idx":    np.where(file_ids == test_fid)[0],
+            "fold":            i,
+            "test_fid":        test_fid,
+            "val_fid":         val_fid,
+            "extra_pure_fids": extra_pure,
+            "train_idx":       np.where(np.isin(file_ids, train_fids))[0],
+            "val_idx":         np.where(file_ids == val_fid)[0],
+            "test_idx":        np.where(np.isin(file_ids, test_fids_all))[0],
         })
     log.info(f"LOSO-CV: {N} folds | seizure files: {sz_files}")
+    log.info(f"  {len(pure_files)} file interictal-thuần → chia round-robin "
+             f"~{len(pure_files)//N} file/fold, cộng vào test để tính FAR "
+             f"(không ảnh hưởng train time/Sensitivity)")
     return folds
 
 
@@ -1338,8 +1866,10 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     val_idx = fold_info["val_idx"]
     te_idx  = fold_info["test_idx"]
 
+    extra_pure = fold_info.get("extra_pure_fids", [])
     log.info(f"\n{'─'*55}")
-    log.info(f"FOLD {fi+1} | test_file={fold_info['test_fid']} | val_file={fold_info['val_fid']}")
+    log.info(f"FOLD {fi+1} | test_file={fold_info['test_fid']} | val_file={fold_info['val_fid']} "
+             f"| +{len(extra_pure)} file interictal-thuần vào test: {extra_pure}")
     log.info(f"  Train: {len(tr_idx)} windows | Val: {len(val_idx)} | Test: {len(te_idx)}")
 
     # ── Balance training set (interictal : pre-ictal ≈ 2:1) ──────────────────
@@ -1353,6 +1883,19 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     n0     = min(len(idx_i), len(idx_p) * 2)
     tr_bal = np.concatenate([rng.choice(idx_i, n0, replace=False), idx_p])
     rng.shuffle(tr_bal)
+
+    # ── Tách train_fit / inner_val CHO EARLY STOPPING — ĐÃ THÊM (chống
+    # "peeking", xem giải thích đầy đủ ở Config.inner_val_frac). inner_val
+    # trích từ TRAIN (không đụng val_idx/test_idx của LOSO) → val_idx của
+    # LOSO giờ hoàn toàn "unseen" đối với quá trình chọn model (EarlyStopping),
+    # chỉ dùng sau đó cho Platt scaling + threshold-selection.
+    y_tr_bal = y_all[tr_bal]
+    tr_fit, inner_val = train_test_split(
+        tr_bal, test_size=cfg.inner_val_frac, random_state=42 + fi,
+        stratify=(y_tr_bal > 0).astype(int),
+    )
+    log.info(f"  Train_fit: {len(tr_fit)} windows | Inner_val (early-stop): {len(inner_val)} "
+             f"| LOSO Val (threshold/calib, KHÔNG dùng cho early-stop): {len(val_idx)}")
 
     # ── Entropy norm stats — CHỈ từ train gốc của fold này (tr_idx, trước khi
     #    balance), KHÔNG bao giờ dùng val/test. Đây là fix cho data leakage đã
@@ -1379,17 +1922,34 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     # so với target 0.80). .repeat() cho generator khởi động lại (và tự
     # shuffle lại nhờ np.random.permutation bên trong gen()) mỗi epoch.
     train_ds = tf.data.Dataset.from_generator(
-        make_generator(tr_bal, h5path, cfg, ent_stats, shuffle=True, augment=True),
+        make_generator(tr_fit, h5path, cfg, ent_stats, shuffle=True, augment=True,
+                        seed=3000 + fi),   # RNG cục bộ riêng cho generator, độc lập
+                                            # global np.random — xem docstring make_generator
         output_signature=out_sig,
     ).repeat().prefetch(tf.data.AUTOTUNE)
 
     # ── Build model ───────────────────────────────────────────────────────────
     tf.keras.backend.clear_session()
+    # ĐÃ THÊM (fix #4 — seed cố định THEO TỪNG FOLD): trước đây chỉ gọi
+    # tf.random.set_seed(42) DUY NHẤT 1 lần ở đầu file (module-level) — từ
+    # fold thứ 2 trở đi, init weight + toàn bộ random op của TF (Dropout,...)
+    # tiếp tục từ đúng VỊ TRÍ mà stream ngẫu nhiên toàn cục đã dừng lại sau
+    # fold trước, vị trí này lại phụ thuộc SỐ LƯỢNG random op đã tiêu thụ ở
+    # fold trước (VD số epoch thực chạy trước khi EarlyStopping — vốn không
+    # cố định) → 2 lần chạy CÙNG code cho AUC khác nhau (VD Fold 7: 0.221 vs
+    # 0.312) dù không đổi gì, khiến không thể phân biệt "cải thiện thật" với
+    # "nhiễu ngẫu nhiên" giữa các lần thử nghiệm. Sửa: reset lại seed (cả TF
+    # lẫn numpy global — numpy global dùng bởi shuffle/augment trong
+    # make_generator) THEO SỐ FOLD ngay sau clear_session(), độc lập hoàn
+    # toàn với các fold trước → mỗi fold giờ REPRODUCIBLE, so sánh ablation
+    # giữa các lần chạy mới có ý nghĩa khoa học.
+    tf.random.set_seed(1000 + fi)
+    np.random.seed(2000 + fi)
     model = build_model(time_ds, feat_size, entropy_size)
     if fi == 0:
         model.summary(print_fn=lambda s: log.info(s))
 
-    steps = max(1, len(tr_bal) // cfg.batch_size)
+    steps = max(1, len(tr_fit) // cfg.batch_size)
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=cfg.lr_init,
         decay_steps=steps * cfg.epochs,
@@ -1408,8 +1968,9 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
         ModelCheckpoint(ckpt_path, monitor="val_loss", save_best_only=True, verbose=0),
     ]
 
-    # Val data in memory (small enough for eval during training)
-    Xv, Ev, yv, _, _, _ = load_split_to_memory(val_idx, h5path, cfg, ent_stats)
+    # ĐÃ SỬA: EarlyStopping/ModelCheckpoint giờ theo dõi inner_val (trích từ
+    # TRAIN) thay vì val_idx của LOSO — xem giải thích ở Config.inner_val_frac.
+    Xv, Ev, yv, _, _, _ = load_split_to_memory(inner_val, h5path, cfg, ent_stats)
     val_data = ({"temporal": Xv, "entropy": Ev}, yv)
 
     # ĐO THỜI GIAN từng giai đoạn — để chẩn đoán fold nào chậm bất thường (vd.
@@ -1449,11 +2010,19 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
 
     # ── Probability Calibration (Platt scaling) ────────────────────────────────
     # Fit trên VAL của CHÍNH fold này, áp dụng cho CẢ val lẫn test (không leak
-    # — test không tham gia fit). Nếu val chỉ có 1 lớp (không đủ đa dạng để
-    # fit logistic regression), fallback về raw scores + log cảnh báo.
+    # — test không tham gia fit). Guard (Config.platt_min_class_n /
+    # platt_min_calibrated_range) tự fallback về raw scores nếu calibration
+    # suy biến — xem chi tiết ở fit_platt_scaling().
+    # ĐÃ SỬA (bug — chữ ký hàm đổi nhưng nơi gọi cũ chưa cập nhật): hàm giờ
+    # trả về (calibrate_fn, reason) thay vì chỉ calibrate_fn. Gọi kiểu cũ
+    # `calibrate_fn = fit_platt_scaling(...)` sẽ gán CẢ TUPLE vào calibrate_fn
+    # → `if calibrate_fn is not None` luôn True (tuple không bao giờ None) →
+    # `calibrate_fn(pred_val)` crash TypeError ngay khi chạy. Sửa: unpack
+    # đúng 2 giá trị, log rõ "reason" cụ thể khi guard chặn (thay vì thông
+    # báo chung chung "1 lớp" như bản cũ).
     if cfg.use_calibration:
         t_calib0 = time.time()
-        calibrate_fn = fit_platt_scaling(pred_val, yv)
+        calibrate_fn, reason = fit_platt_scaling(pred_val, yv, cfg)
         if calibrate_fn is not None:
             pred_val_raw, pred_test_raw = pred_val, pred_test
             pred_val  = calibrate_fn(pred_val)
@@ -1462,8 +2031,9 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
                      f"(raw val range=[{pred_val_raw.min():.3f},{pred_val_raw.max():.3f}] "
                      f"→ calibrated=[{pred_val.min():.3f},{pred_val.max():.3f}])")
         else:
-            log.warning("  Platt scaling: val chỉ có 1 lớp (toàn preictal hoặc toàn "
-                        "interictal) — không fit được, dùng raw scores.")
+            log.warning(f"  Platt scaling: BỎ QUA calibration — {reason}. Dùng raw scores "
+                        f"(vẫn hợp lệ cho threshold percentile vì percentile không đổi thứ hạng).")
+
 
     # ── AUC on test ──────────────────────────────────────────────────────────
     y_bin_te = (yt > 0).astype(int)
@@ -1641,11 +2211,14 @@ def run_loso_cv(cfg: Config):
     if cfg.threshold_mode == "absolute":
         log.info(f"Threshold mode: ABSOLUTE cố định (thr_on={cfg.fixed_thr_on}, thr_off={cfg.fixed_thr_off}) "
                  f"— không nhìn val để chọn")
+    elif cfg.threshold_mode == "relative":
+        log.info(f"Threshold mode: RELATIVE — anchor=INTERICTAL score distribution "
+                 f"(fa_pct={cfg.interictal_fa_pct:.1f}%, margin={cfg.relative_pct_margin:.0f} điểm %), "
+                 f"không dùng preictal_frac/event để chọn")
     else:
-        log.info(f"Threshold mode: RELATIVE percentile TỰ THÍCH NGHI (margin="
-                 f"{cfg.relative_pct_margin:.0f} điểm %) — percentile suy ra từ tỷ lệ "
-                 f"preictal thật của val mỗi fold, tự thích nghi cả thang đo score LẪN "
-                 f"mật độ preictal, không nhìn event để chọn")
+        log.info(f"Threshold mode: LEARN_THEN_TEST — Hoeffding-Bentkus + Fixed Sequence Testing "
+                 f"(target_risk={cfg.ltt_target_risk:.2f}, delta={cfg.ltt_delta:.2f} → đảm bảo thống kê "
+                 f"P(FAR thật vượt mục tiêu) ≤ {cfg.ltt_delta:.0%}), không dùng event để chọn")
     log.info(f"{'='*60}")
 
     # ── Load metadata ─────────────────────────────────────────────────────────
@@ -1663,6 +2236,9 @@ def run_loso_cv(cfg: Config):
     log.info(f"Dataset: {len(y_all)} windows | {n_ch} ch | {len(np.unique(file_ids))} files")
     log.info(f"Pre-ictal ratio: {(y_all > 0).mean():.3f}")
     log.info(f"Model input: temporal=({time_ds}, {feat_sz})  entropy=({3*n_ch},)")
+
+    # ── Precompute cache decimate (Xds) 1 lần, dùng chung cho mọi fold ─────────
+    ensure_xds_cache(cfg.hdf5_path, cfg, time_ds, feat_sz)
 
     # ── Generate LOSO folds ───────────────────────────────────────────────────
     folds = generate_loso_folds(file_ids, y_all)
