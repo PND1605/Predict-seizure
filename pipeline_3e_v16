@@ -2249,8 +2249,8 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     if cfg.use_calibration:
         t_calib0 = time.time()
         calibrate_fn, reason = fit_platt_scaling(pred_val, yv, cfg)
+        pred_val_raw, pred_test_raw = pred_val.copy(), pred_test.copy()   # luôn giữ bản RAW để dump/so sánh
         if calibrate_fn is not None:
-            pred_val_raw, pred_test_raw = pred_val, pred_test
             pred_val  = calibrate_fn(pred_val)
             pred_test = calibrate_fn(pred_test)
             log.info(f"  [time] Platt scaling fit+apply: {time.time()-t_calib0:.1f}s "
@@ -2259,6 +2259,8 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
         else:
             log.warning(f"  Platt scaling: BỎ QUA calibration — {reason}. Dùng raw scores "
                         f"(vẫn hợp lệ cho threshold percentile vì percentile không đổi thứ hạng).")
+    else:
+        pred_val_raw, pred_test_raw = pred_val.copy(), pred_test.copy()
 
 
     # ── AUC on test ──────────────────────────────────────────────────────────
@@ -2277,6 +2279,23 @@ def run_single_fold(fold_info: dict, file_ids, y_all, tts_all, h5path: str, cfg:
     t_grid0 = time.time()
     thr_on, thr_off = select_threshold(yv, pred_val, ttsv, fidv, voter, cfg, val_t=tv)
     log.info(f"  [time] threshold selection: {time.time()-t_grid0:.1f}s")
+
+    # ── ĐÃ THÊM: dump toàn bộ score thô/đã hiệu chỉnh ra .npz — PHỤC VỤ
+    # score_distribution_analysis.ipynb. Trước đây các mảng pred_val/
+    # pred_test bị VỨT BỎ sau mỗi fold (chỉ summary_chb01.json — số liệu
+    # tổng hợp — được lưu lại), không thể phân tích lại phân phối score sau
+    # khi chạy xong. File .npz này nhỏ (vài trăm KB/fold), lưu ĐẦY ĐỦ để
+    # notebook phân tích riêng đọc lại mà KHÔNG cần chạy lại model.
+    diag_path = os.path.join(cfg.output_dir, f"fold{fi}_score_diag.npz")
+    np.savez(
+        diag_path,
+        test_fid=fold_info["test_fid"], val_fid=fold_info["val_fid"], fold=fi,
+        pred_val_raw=pred_val_raw, pred_val_cal=pred_val, y_val=yv, tts_val=ttsv, fid_val=fidv,
+        pred_test_raw=pred_test_raw, pred_test_cal=pred_test, y_test=yt, tts_test=ttst, fid_test=fidt,
+        thr_on=thr_on, thr_off=thr_off,
+        threshold_mode=cfg.threshold_mode, ltt_target_risk=cfg.ltt_target_risk, ltt_delta=cfg.ltt_delta,
+    )
+    log.info(f"  [diag] Đã lưu score_diag: {diag_path}")
 
     # ── Clinical metrics on TEST (no data leakage) ────────────────────────────
     m = metrics_grouped(yt, pred_test, ttst, fidt, voter, thr_on, thr_off, cfg, t=tt)
